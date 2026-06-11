@@ -28,7 +28,10 @@ export default function SkillsSection() {
 
         <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-8">
           {skills.map(skill => (
-            <div key={skill.category} className="bg-gray-50 rounded-lg p-6 hover:shadow-lg transition-shadow">
+            <div
+              key={skill.category}
+              className="bg-gray-50 rounded-lg p-6 hover:shadow-lg transition-shadow"
+            >
               <h3 className="text-xl font-bold text-blue-600 mb-4">{skill.category}</h3>
               <ul className="space-y-2">
                 {skill.items.map(item => (

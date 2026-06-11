@@ -132,9 +132,7 @@ describe('contactSchema', () => {
 
       expect(result.success).toBe(false);
       if (!result.success) {
-        expect(result.error.issues[0].message).toBe(
-          'Mensagem deve ter no máximo 1000 caracteres'
-        );
+        expect(result.error.issues[0].message).toBe('Mensagem deve ter no máximo 1000 caracteres');
       }
     });
   });

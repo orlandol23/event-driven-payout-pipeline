@@ -24,8 +24,7 @@ export default function FeaturedProjects() {
     {
       id: '3',
       title: 'Blog Platform',
-      description:
-        'Plataforma de blog com CMS headless, markdown support e otimização de SEO.',
+      description: 'Plataforma de blog com CMS headless, markdown support e otimização de SEO.',
       tags: ['Next.js', 'Contentful', 'MDX', 'SEO'],
       href: '/projects/blog',
     },

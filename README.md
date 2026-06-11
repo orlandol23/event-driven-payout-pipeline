@@ -10,27 +10,32 @@ Portfolio profissional desenvolvido com Next.js 14+, TypeScript, Tailwind CSS e 
 ## 🚀 Tecnologias
 
 ### Core
+
 - **Next.js 14+** - Framework React com App Router
 - **React 18+** - Biblioteca UI
 - **TypeScript** - Tipagem estática (strict mode)
 - **Tailwind CSS** - Framework CSS utility-first
 
 ### Formulários e Validação
+
 - **React Hook Form** - Gerenciamento de formulários
 - **Zod** - Validação de schemas
 - **DOMPurify** - Sanitização XSS
 
 ### Testes
+
 - **Jest** - Framework de testes
 - **React Testing Library** - Testes de componentes
 - **Coverage > 70%** - Alta cobertura de testes
 
 ### Qualidade de Código
+
 - **ESLint** - Linter JavaScript/TypeScript
 - **Prettier** - Formatação de código
 - **TypeScript Strict Mode** - Tipagem rigorosa
 
 ### DevOps
+
 - **GitHub Actions** - CI/CD
 - **Vercel** - Deploy e hosting
 
@@ -130,6 +135,7 @@ npm run test:watch
 ## 🔒 Segurança
 
 ### Headers de Segurança
+
 - `X-Frame-Options: DENY` - Previne clickjacking
 - `X-Content-Type-Options: nosniff` - Previne MIME sniffing
 - `X-XSS-Protection: 1; mode=block` - Proteção XSS
@@ -137,6 +143,7 @@ npm run test:watch
 - `Referrer-Policy` - Controle de referrer
 
 ### Validação e Sanitização
+
 - Validação dupla (frontend + backend) com Zod
 - Sanitização de inputs com DOMPurify
 - Rate limiting em API routes (recomendado para produção)
@@ -189,6 +196,7 @@ Este projeto está sob a licença MIT. Veja o arquivo [LICENSE](LICENSE) para ma
 ## 🤝 Contato
 
 Orlando Fernandes
+
 - Email: orlando@example.com
 - LinkedIn: [/in/orlando-fernandes](https://linkedin.com/in/orlando-fernandes)
 - GitHub: [@orlandol23](https://github.com/orlandol23)

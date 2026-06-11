@@ -10,14 +10,7 @@ interface CardProps {
   children?: React.ReactNode;
 }
 
-export default function Card({
-  title,
-  description,
-  image,
-  tags,
-  href,
-  children,
-}: CardProps) {
+export default function Card({ title, description, image, tags, href, children }: CardProps) {
   return (
     <div className="bg-white rounded-lg shadow-md overflow-hidden hover:shadow-xl transition-shadow duration-300">
       {image && (
@@ -38,10 +31,7 @@ export default function Card({
         {tags && tags.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-4">
             {tags.map(tag => (
-              <span
-                key={tag}
-                className="px-2 py-1 bg-blue-100 text-blue-800 text-sm rounded"
-              >
+              <span key={tag} className="px-2 py-1 bg-blue-100 text-blue-800 text-sm rounded">
                 {tag}
               </span>
             ))}

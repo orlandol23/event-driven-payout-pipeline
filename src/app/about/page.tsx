@@ -3,8 +3,7 @@ import type { Metadata } from 'next';
 
 export const metadata: Metadata = {
   title: 'Sobre',
-  description:
-    'Conheça mais sobre Orlando Fernandes, sua experiência e trajetória profissional.',
+  description: 'Conheça mais sobre Orlando Fernandes, sua experiência e trajetória profissional.',
 };
 
 export default function AboutPage() {
@@ -17,9 +16,9 @@ export default function AboutPage() {
           <section className="mb-8">
             <h2 className="text-2xl font-bold text-gray-900 mb-4">Quem sou eu</h2>
             <p className="text-gray-700 mb-4">
-              Sou Orlando Fernandes, um <strong>Senior Software Engineer</strong> com mais de 5
-              anos de experiência em desenvolvimento web, especializado em criar aplicações
-              modernas, escaláveis e centradas no usuário.
+              Sou Orlando Fernandes, um <strong>Senior Software Engineer</strong> com mais de 5 anos
+              de experiência em desenvolvimento web, especializado em criar aplicações modernas,
+              escaláveis e centradas no usuário.
             </p>
             <p className="text-gray-700 mb-4">
               Minha jornada na tecnologia começou com curiosidade sobre como as coisas funcionam na

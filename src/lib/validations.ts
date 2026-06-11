@@ -8,10 +8,7 @@ export const contactSchema = z.object({
     .max(100, 'Nome deve ter no máximo 100 caracteres')
     .regex(/^[a-zA-ZÀ-ÿ\s]+$/, 'Nome deve conter apenas letras'),
 
-  email: z
-    .string()
-    .email('Email inválido')
-    .max(255, 'Email deve ter no máximo 255 caracteres'),
+  email: z.string().email('Email inválido').max(255, 'Email deve ter no máximo 255 caracteres'),
 
   message: z
     .string()
