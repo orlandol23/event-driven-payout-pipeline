@@ -1,0 +1,206 @@
+package io.github.orlandol23.payout.api.payout;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Captor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataIntegrityViolationException;
+
+import java.math.BigDecimal;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.Optional;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * Unit tests for the creation rules and the idempotency race recovery.
+ *
+ * <p>The repository is a mock here on purpose: these tests are about the
+ * decisions the service makes, and the only way to reproduce "another request
+ * won the insert race" deterministically is to make the repository behave as if
+ * one had. Whether the unique index actually fires is a database question, so it
+ * is answered by {@code PayoutApiIT} against a real PostgreSQL instead.
+ */
+@ExtendWith(MockitoExtension.class)
+class PayoutServiceTest {
+
+    private static final Instant NOW = Instant.parse("2026-07-27T10:15:30Z");
+    private static final Clock FIXED_CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
+
+    private static final String CORRELATION_ID = "corr-abc-123";
+    private static final String IDEMPOTENCY_KEY = "key-abc-123";
+
+    @Mock
+    private PayoutRepository repository;
+
+    @Captor
+    private ArgumentCaptor<Payout> payoutCaptor;
+
+    private PayoutService service;
+
+    private PayoutService service() {
+        if (service == null) {
+            service = new PayoutService(repository, FIXED_CLOCK);
+        }
+        return service;
+    }
+
+    @Nested
+    @DisplayName("create")
+    class Create {
+
+        @Test
+        @DisplayName("stores a new payout as PENDING with zero attempts")
+        void storesNewPayoutAsPending() {
+            when(repository.saveAndFlush(any(Payout.class))).thenAnswer(call -> call.getArgument(0));
+
+            PayoutCreation creation = service().create(command(new BigDecimal("125.50"), "BRL", IDEMPOTENCY_KEY));
+
+            verify(repository).saveAndFlush(payoutCaptor.capture());
+            Payout saved = payoutCaptor.getValue();
+
+            assertThat(creation.replayed()).isFalse();
+            assertThat(saved.getStatus()).isEqualTo(PayoutStatus.PENDING);
+            assertThat(saved.getAttempts()).isZero();
+            assertThat(saved.getLastError()).isNull();
+            assertThat(saved.getId()).isNotNull();
+            assertThat(saved.getCurrency()).isEqualTo("BRL");
+            assertThat(saved.getCorrelationId()).isEqualTo(CORRELATION_ID);
+            assertThat(saved.getIdempotencyKey()).isEqualTo(IDEMPOTENCY_KEY);
+        }
+
+        @Test
+        @DisplayName("normalises the amount to the stored scale so 10.5 and 10.5000 are one value")
+        void normalisesAmountScale() {
+            when(repository.saveAndFlush(any(Payout.class))).thenAnswer(call -> call.getArgument(0));
+
+            service().create(command(new BigDecimal("10.5"), "USD", null));
+
+            verify(repository).saveAndFlush(payoutCaptor.capture());
+            assertThat(payoutCaptor.getValue().getAmount()).isEqualByComparingTo("10.5");
+            assertThat(payoutCaptor.getValue().getAmount().scale()).isEqualTo(Payout.AMOUNT_SCALE);
+        }
+
+        @Test
+        @DisplayName("timestamps come from the injected clock, not from the wall clock")
+        void timestampsComeFromTheInjectedClock() {
+            when(repository.saveAndFlush(any(Payout.class))).thenAnswer(call -> call.getArgument(0));
+
+            service().create(command(new BigDecimal("1.0000"), "EUR", null));
+
+            verify(repository).saveAndFlush(payoutCaptor.capture());
+            assertThat(payoutCaptor.getValue().getCreatedAt()).isEqualTo(NOW);
+            assertThat(payoutCaptor.getValue().getUpdatedAt()).isEqualTo(NOW);
+        }
+
+        @Test
+        @DisplayName("skips the idempotency lookup entirely when no key was supplied")
+        void skipsLookupWithoutKey() {
+            when(repository.saveAndFlush(any(Payout.class))).thenAnswer(call -> call.getArgument(0));
+
+            service().create(command(new BigDecimal("5.0000"), "USD", null));
+
+            verify(repository, never()).findByIdempotencyKey(any());
+        }
+
+        @Test
+        @DisplayName("returns the existing payout, and does not insert, when the key was already used")
+        void replaysExistingPayout() {
+            Payout existing = existingPayout();
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY)).thenReturn(Optional.of(existing));
+
+            PayoutCreation creation = service().create(command(new BigDecimal("125.50"), "BRL", IDEMPOTENCY_KEY));
+
+            assertThat(creation.replayed()).isTrue();
+            assertThat(creation.payout()).isSameAs(existing);
+            verify(repository, never()).saveAndFlush(any());
+        }
+
+        @Test
+        @DisplayName("recovers by re-reading when a concurrent request won the insert race")
+        void recoversAfterLosingTheInsertRace() {
+            Payout winner = existingPayout();
+            // Nothing on the first read: the competing transaction has not
+            // committed yet. It commits before our insert reaches the index.
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY))
+                    .thenReturn(Optional.empty())
+                    .thenReturn(Optional.of(winner));
+            when(repository.saveAndFlush(any(Payout.class)))
+                    .thenThrow(new DataIntegrityViolationException("ux_payouts_idempotency_key"));
+
+            PayoutCreation creation = service().create(command(new BigDecimal("125.50"), "BRL", IDEMPOTENCY_KEY));
+
+            assertThat(creation.replayed()).isTrue();
+            assertThat(creation.payout()).isSameAs(winner);
+        }
+
+        @Test
+        @DisplayName("rethrows when the violation was not the idempotency index")
+        void rethrowsUnrelatedViolation() {
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY)).thenReturn(Optional.empty());
+            when(repository.saveAndFlush(any(Payout.class)))
+                    .thenThrow(new DataIntegrityViolationException("ck_payouts_amount_positive"));
+
+            assertThatThrownBy(() -> service().create(command(new BigDecimal("125.50"), "BRL", IDEMPOTENCY_KEY)))
+                    .isInstanceOf(DataIntegrityViolationException.class);
+        }
+
+        @Test
+        @DisplayName("rethrows a violation when there is no key to recover with")
+        void rethrowsWhenThereIsNoKey() {
+            when(repository.saveAndFlush(any(Payout.class)))
+                    .thenThrow(new DataIntegrityViolationException("some other constraint"));
+
+            assertThatThrownBy(() -> service().create(command(new BigDecimal("125.50"), "BRL", null)))
+                    .isInstanceOf(DataIntegrityViolationException.class);
+            verify(repository, never()).findByIdempotencyKey(any());
+        }
+    }
+
+    @Nested
+    @DisplayName("findById")
+    class FindById {
+
+        @Test
+        @DisplayName("returns the payout when it exists")
+        void returnsPayout() {
+            Payout existing = existingPayout();
+            when(repository.findById(existing.getId())).thenReturn(Optional.of(existing));
+
+            assertThat(service().findById(existing.getId())).isSameAs(existing);
+        }
+
+        @Test
+        @DisplayName("throws PayoutNotFoundException carrying the id that was asked for")
+        void throwsWhenMissing() {
+            UUID missing = UUID.randomUUID();
+            when(repository.findById(missing)).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> service().findById(missing))
+                    .isInstanceOf(PayoutNotFoundException.class)
+                    .extracting(exception -> ((PayoutNotFoundException) exception).getPayoutId())
+                    .isEqualTo(missing);
+        }
+    }
+
+    private static CreatePayoutCommand command(BigDecimal amount, String currency, String idempotencyKey) {
+        return new CreatePayoutCommand(amount, currency, idempotencyKey, CORRELATION_ID);
+    }
+
+    private static Payout existingPayout() {
+        return Payout.request(UUID.randomUUID(), IDEMPOTENCY_KEY, new BigDecimal("125.5000"), "BRL",
+                CORRELATION_ID, NOW);
+    }
+}
