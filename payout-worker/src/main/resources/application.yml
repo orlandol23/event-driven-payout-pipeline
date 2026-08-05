@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: payout-worker
+  threads:
+    virtual:
+      enabled: true
+
+server:
+  # A different port from payout-api so both run side by side on one machine.
+  # The worker serves no business traffic; this port exists for health probes
+  # and, from day 4, for the Prometheus scrape.
+  port: ${PAYOUT_WORKER_PORT:8081}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+logging:
+  level:
+    io.github.orlandol23.payout: ${PAYOUT_LOG_LEVEL:INFO}
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%X{correlationId:-no-correlation-id}] %logger{36} - %msg%n"

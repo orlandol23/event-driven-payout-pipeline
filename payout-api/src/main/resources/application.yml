@@ -1,0 +1,85 @@
+spring:
+  application:
+    name: payout-api
+
+  datasource:
+    # Defaults match docker-compose.yml so a fresh clone runs with no setup.
+    # They are local development values, not secrets: every deployed environment
+    # injects these through the environment (AWS Secrets Manager on day 5).
+    url: ${PAYOUT_DB_URL:jdbc:postgresql://localhost:5432/payout}
+    username: ${PAYOUT_DB_USERNAME:payout}
+    password: ${PAYOUT_DB_PASSWORD:payout}
+    hikari:
+      pool-name: payout-api-pool
+      maximum-pool-size: ${PAYOUT_DB_POOL_SIZE:10}
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # The schema must be created by a migration, never by an empty database
+    # being adopted silently.
+    baseline-on-migrate: false
+
+  jpa:
+    hibernate:
+      # validate, not update. Flyway owns the schema; Hibernate only asserts that
+      # the entities still match it and refuses to start if they drifted. ddl-auto
+      # update would let a mapping change quietly rewrite production DDL, in an
+      # order nobody reviewed and with no way back.
+      ddl-auto: validate
+    # Off deliberately. Open Session In View keeps a database connection pinned
+    # for the whole request including view rendering, which hides lazy loading
+    # bugs behind a connection the service layer already returned.
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+        # Fail loudly on N+1 style surprises rather than emitting silent queries.
+        query:
+          fail_on_pagination_over_collection_fetch: true
+
+  # Left off. This advice class builds the problem documents by hand so it can
+  # attach the correlation id and the per-field errors; enabling both would mean
+  # two mechanisms competing for the same responses.
+  mvc:
+    problemdetails:
+      enabled: false
+
+  threads:
+    virtual:
+      # Java 21 virtual threads for request handling. Payout requests are
+      # IO bound on PostgreSQL and, from day 2, on Kafka, which is precisely the
+      # workload where a platform thread per request is wasted memory.
+      enabled: true
+
+server:
+  port: ${PAYOUT_API_PORT:8080}
+  error:
+    # Nothing should ever reach the default error page: GlobalExceptionHandler
+    # answers every failure. These settings make sure that if something does,
+    # it leaks nothing.
+    include-message: never
+    include-stacktrace: never
+    include-binding-errors: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Deliberately narrow. Full observability, Prometheus included, lands on
+        # day 4 together with the metrics worth scraping.
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+
+logging:
+  level:
+    io.github.orlandol23.payout: ${PAYOUT_LOG_LEVEL:INFO}
+  # Correlation id on every line. Structured JSON logging replaces this pattern
+  # on day 4, when there is a log aggregator that benefits from it.
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%X{correlationId:-no-correlation-id}] %logger{36} - %msg%n"

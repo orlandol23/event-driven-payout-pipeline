@@ -1,0 +1,32 @@
+# Build output
+target/
+
+# Maven wrapper: the scripts and properties are committed on purpose, so a
+# reviewer can run ./mvnw without installing Maven. Only its download cache is not.
+.mvn/wrapper/maven-wrapper.jar
+
+# Secrets and local configuration. .env.example is the committed template.
+.env
+.env.local
+*.pem
+*.p12
+*.jks
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+nbproject/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

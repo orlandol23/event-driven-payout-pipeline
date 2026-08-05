@@ -1,0 +1,58 @@
+# Local development stack.
+#
+# Day 1 runs PostgreSQL only. The Kafka broker and Kafka UI land on day 2; the
+# network, the healthcheck convention and the .env driven configuration below are
+# already shaped to take them without restructuring anything.
+#
+#   cp .env.example .env
+#   docker compose up -d
+#   mvn -pl payout-api spring-boot:run
+
+name: payout-platform
+
+services:
+  postgres:
+    # Pinned to a major version rather than :latest, and to the same major the
+    # integration tests and the target RDS instance use. A silent major upgrade
+    # is how a migration that passed CI fails on deploy.
+    image: postgres:16-alpine
+    container_name: payout-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-payout}
+      POSTGRES_USER: ${POSTGRES_USER:-payout}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-payout}
+      # Deterministic collation, so ORDER BY and index behaviour match across
+      # every developer machine and CI.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Depending on the port being open is not enough: PostgreSQL accepts
+      # connections briefly during init and then restarts. pg_isready against the
+      # real database and user is the honest check, and it is what lets the
+      # services added on day 2 wait for a database that is actually usable.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-payout} -d ${POSTGRES_DB:-payout}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - payout-net
+
+  # ---------------------------------------------------------------------------
+  # Day 2 adds here:
+  #   kafka     a KRaft mode broker, no ZooKeeper
+  #   kafka-ui  to inspect payout.requested and the dead letter topic
+  # Both join payout-net and follow the same healthcheck and .env conventions.
+  # ---------------------------------------------------------------------------
+
+volumes:
+  postgres-data:
+    driver: local
+
+networks:
+  payout-net:
+    driver: bridge
