@@ -85,6 +85,14 @@ payout:
     # it. Comfortably longer than a settlement call: too short and two workers
     # settle the same payout, too long and a crashed worker's payouts wait.
     stale-lock: ${PAYOUT_WORKER_STALE_LOCK:5m}
+    # The claim scan: how often the worker looks at the table itself, how many
+    # rows it takes at a time, and whether it looks at all. This is what finds
+    # due retries, stale locks, and payouts whose payout.requested event was
+    # never published, which is why Kafka is a latency optimisation here rather
+    # than the source of truth.
+    poll-interval: ${PAYOUT_WORKER_POLL_INTERVAL:15s}
+    poll-batch-size: ${PAYOUT_WORKER_POLL_BATCH_SIZE:50}
+    poll-enabled: ${PAYOUT_WORKER_POLL_ENABLED:true}
     settlement:
       # No money moves. The amounts below select the outcome deterministically,
       # so every branch of the retry policy is reachable from a curl command.

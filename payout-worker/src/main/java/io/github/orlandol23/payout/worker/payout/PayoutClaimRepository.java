@@ -1,13 +1,14 @@
 package io.github.orlandol23.payout.worker.payout;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 /**
  * The worker's entire view of the {@code payouts} table.
  *
- * <p>Four statements, no entity, no persistence context. The API owns the schema
+ * <p>Five statements, no entity, no persistence context. The API owns the schema
  * and the row's shape; the worker owns the transitions on it and reads exactly
  * the columns it needs to make them. That narrowness is the price of two
  * services sharing one database, and it is cheap only as long as it is actually
@@ -51,6 +52,25 @@ public interface PayoutClaimRepository {
      *            "due" and "stale" are judged
      */
     Optional<ClaimedPayout> claim(UUID payoutId, Instant now);
+
+    /**
+     * Claims a batch of whatever is due, oldest request first.
+     *
+     * <p>The same predicate as {@link #claim}, without an id. This is what makes
+     * the table the source of truth rather than the topic: it finds retries that
+     * have come due, locks whose worker died, and payouts whose
+     * {@code payout.requested} event was never published because the broker was
+     * down when the row was committed. Kafka gets those payouts settled in
+     * milliseconds; this gets them settled at all.
+     *
+     * <p>Batched and ordered, so a backlog is worked through oldest first rather
+     * than in whatever order the planner likes, and bounded so one scan cannot
+     * lock the entire table.
+     *
+     * @param limit how many rows to take at most
+     * @return the rows this call now holds, in the order they should be settled
+     */
+    List<ClaimedPayout> claimDue(int limit, Instant now);
 
     /** Marks a settled payout {@code CONFIRMED} and releases the lock. Terminal. */
     void confirm(UUID payoutId, Instant now);

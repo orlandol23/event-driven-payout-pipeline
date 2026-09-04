@@ -4,10 +4,12 @@ import io.github.orlandol23.payout.worker.config.WorkerProperties;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -57,6 +59,50 @@ public class JdbcPayoutClaimRepository implements PayoutClaimRepository {
                      OR (status = 'PROCESSING' AND locked_at < :staleBefore)
                    )
             RETURNING id, amount, currency, correlation_id, attempts, created_at
+            """;
+
+    /**
+     * The same claim, without an id: take the oldest due rows, up to a limit.
+     *
+     * <p>{@code FOR UPDATE SKIP LOCKED} is what makes this safe to run on every
+     * worker at once. Each scan locks the rows it selected and skips any row
+     * another scan is already holding, so two workers sweeping simultaneously
+     * divide the backlog instead of fighting over the front of it. Without
+     * {@code SKIP LOCKED} the second worker would block on the first one's rows
+     * and the scans would serialise; without {@code FOR UPDATE} both would
+     * select the same ids and one would find them already claimed.
+     *
+     * <p>The CTE and the UPDATE are one statement, so they are one transaction
+     * and one snapshot: nothing can slip between selecting a row and claiming
+     * it. The predicate is repeated on the UPDATE anyway. It is redundant while
+     * the lock is held, and it is what keeps the statement correct rather than
+     * subtly wrong if the locking clause is ever edited out.
+     */
+    private static final String CLAIM_DUE = """
+            WITH due AS (
+                SELECT id
+                  FROM payouts
+                 WHERE (status = 'PENDING'
+                        AND (next_attempt_at IS NULL OR next_attempt_at <= :now))
+                    OR (status = 'PROCESSING' AND locked_at < :staleBefore)
+                 ORDER BY created_at
+                 LIMIT :limit
+                   FOR UPDATE SKIP LOCKED
+            )
+            UPDATE payouts
+               SET status     = 'PROCESSING',
+                   attempts   = attempts + 1,
+                   locked_at  = :now,
+                   updated_at = :now
+              FROM due
+             WHERE payouts.id = due.id
+               AND (
+                        (payouts.status = 'PENDING'
+                         AND (payouts.next_attempt_at IS NULL OR payouts.next_attempt_at <= :now))
+                     OR (payouts.status = 'PROCESSING' AND payouts.locked_at < :staleBefore)
+                   )
+            RETURNING payouts.id, payouts.amount, payouts.currency,
+                      payouts.correlation_id, payouts.attempts, payouts.created_at
             """;
 
     private static final String CONFIRM = """
@@ -129,6 +175,23 @@ public class JdbcPayoutClaimRepository implements PayoutClaimRepository {
                 .param("staleBefore", at(now.minus(properties.staleLock())))
                 .query(CLAIMED)
                 .optional();
+    }
+
+    /**
+     * {@code @Transactional} because the lock the CTE takes has to be held by
+     * something. It is one statement, so it would get an implicit transaction
+     * anyway; declaring it says that the lock scope is deliberate rather than a
+     * property of autocommit that a later edit could remove by accident.
+     */
+    @Override
+    @Transactional
+    public List<ClaimedPayout> claimDue(int limit, Instant now) {
+        return jdbcClient.sql(CLAIM_DUE)
+                .param("limit", limit)
+                .param("now", at(now))
+                .param("staleBefore", at(now.minus(properties.staleLock())))
+                .query(CLAIMED)
+                .list();
     }
 
     @Override

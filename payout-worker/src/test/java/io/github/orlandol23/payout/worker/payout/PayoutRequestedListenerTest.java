@@ -66,7 +66,10 @@ import static org.mockito.Mockito.verify;
  */
 @SpringBootTest(properties = {
         // The simulated provider's latency is realism this test does not need.
-        "payout.worker.settlement.latency=0ms"
+        "payout.worker.settlement.latency=0ms",
+        // This test is about the Kafka path. The claim scan would race it for
+        // the same rows and prove nothing about the listener either way.
+        "payout.worker.poll-enabled=false"
 })
 @EmbeddedKafka(partitions = 1, topics = {PayoutTopics.PAYOUT_REQUESTED, PayoutTopics.PAYOUT_REQUESTED_DLT})
 class PayoutRequestedListenerTest {

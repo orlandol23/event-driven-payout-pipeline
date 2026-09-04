@@ -3,7 +3,9 @@ package io.github.orlandol23.payout.worker.payout;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.HashMap;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -48,7 +50,7 @@ public class InMemoryPayoutClaimRepository implements PayoutClaimRepository {
         }
     }
 
-    private final Map<UUID, Row> rows = new HashMap<>();
+    private final Map<UUID, Row> rows = new LinkedHashMap<>();
     private final Duration staleLock;
 
     public InMemoryPayoutClaimRepository(Duration staleLock) {
@@ -79,6 +81,24 @@ public class InMemoryPayoutClaimRepository implements PayoutClaimRepository {
         row.lockedAt = now;
         return Optional.of(new ClaimedPayout(
                 payoutId, row.amount, row.currency, row.correlationId, row.attempts, row.createdAt));
+    }
+
+    /**
+     * The same predicate, oldest first, up to the limit.
+     *
+     * <p>No stand-in for {@code SKIP LOCKED}: a map has no other transaction to
+     * skip. That the real statement skips rows another worker is holding is
+     * proven in {@code PayoutWorkerIT}, where there is a real lock to hold.
+     */
+    @Override
+    public synchronized List<ClaimedPayout> claimDue(int limit, Instant now) {
+        return rows.entrySet().stream()
+                .filter(entry -> isClaimable(entry.getValue(), now))
+                .sorted(Comparator.comparing(entry -> entry.getValue().createdAt))
+                .limit(limit)
+                .map(entry -> claim(entry.getKey(), now))
+                .flatMap(Optional::stream)
+                .toList();
     }
 
     @Override
