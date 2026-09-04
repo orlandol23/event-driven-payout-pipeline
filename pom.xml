@@ -12,7 +12,13 @@
     <name>payout-platform</name>
     <description>Asynchronous payout pipeline: Spring Boot, PostgreSQL and Kafka</description>
 
+    <!--
+      payout-contracts is listed first because both services depend on it. Maven
+      orders the reactor by the dependency graph rather than by this list, so the
+      order here is documentation, not configuration.
+    -->
     <modules>
+        <module>payout-contracts</module>
         <module>payout-api</module>
         <module>payout-worker</module>
     </modules>
@@ -36,7 +42,7 @@
             <!--
               We import the Spring Boot BOM instead of inheriting from
               spring-boot-starter-parent. Inheriting would force every module,
-              including future plain library modules such as payout-contracts,
+              including plain library modules such as payout-contracts,
               into Boot's parent build conventions. Importing keeps this
               aggregator POM the single owner of the build while still getting
               a curated, consistent set of dependency versions.
