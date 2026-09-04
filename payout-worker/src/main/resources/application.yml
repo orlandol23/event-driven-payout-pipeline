@@ -5,8 +5,41 @@ spring:
     virtual:
       enabled: true
 
+  datasource:
+    # The same database payout-api writes to, and the same local defaults, so a
+    # fresh clone runs with no setup. Sharing it is the design, not an accident:
+    # the queue is a table and the claim is a conditional UPDATE against it.
+    #
+    # There is no spring.flyway section and no flyway on this classpath. The API
+    # owns the schema and migrates it on start; a second service running the same
+    # migrations is a race at deploy time for no benefit. If the worker starts
+    # against a database the API has not migrated yet, its statements fail and
+    # the rows stay claimable until it has.
+    url: ${PAYOUT_DB_URL:jdbc:postgresql://localhost:5432/payout}
+    username: ${PAYOUT_DB_USERNAME:payout}
+    password: ${PAYOUT_DB_PASSWORD:payout}
+    hikari:
+      pool-name: payout-worker-pool
+      maximum-pool-size: ${PAYOUT_DB_POOL_SIZE:10}
+
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    # The worker produces exactly one kind of record: a dead letter. Same
+    # settings as the API's producer, for the same reasons, and deliberately not
+    # a second opinion on durability in the service that decides a payout is
+    # beyond saving.
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.block.ms: 5000
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+        # No __TypeId__ header: a consumer of the dead letter topic is told what
+        # to expect by its own configuration, not by our package layout.
+        spring.json.add.type.headers: false
     consumer:
       # No group-id here on purpose: it lives on @KafkaListener, next to the
       # listener it scales, so there is one place to read it.
@@ -40,6 +73,26 @@ spring:
       # record", which is the only interpretation that stays true once day 3
       # settles money in there.
       ack-mode: manual_immediate
+
+payout:
+  worker:
+    # How many settlement attempts a payout gets before it is failed and dead
+    # lettered. Counted at claim time, so a worker that dies mid-settlement
+    # spends one: the conservative direction when the alternative is retrying a
+    # payment that may already have gone through.
+    max-attempts: ${PAYOUT_WORKER_MAX_ATTEMPTS:5}
+    # How long a PROCESSING row may hold its lock before another worker may take
+    # it. Comfortably longer than a settlement call: too short and two workers
+    # settle the same payout, too long and a crashed worker's payouts wait.
+    stale-lock: ${PAYOUT_WORKER_STALE_LOCK:5m}
+    settlement:
+      # No money moves. The amounts below select the outcome deterministically,
+      # so every branch of the retry policy is reachable from a curl command.
+      # See the failure mode table in the README.
+      latency: ${PAYOUT_WORKER_SETTLEMENT_LATENCY:200ms}
+      transient-cents: ${PAYOUT_WORKER_SETTLEMENT_TRANSIENT_CENTS:13}
+      permanent-cents: ${PAYOUT_WORKER_SETTLEMENT_PERMANENT_CENTS:66}
+      rejected-currency: ${PAYOUT_WORKER_SETTLEMENT_REJECTED_CURRENCY:XTS}
 
 server:
   # A different port from payout-api so both run side by side on one machine.

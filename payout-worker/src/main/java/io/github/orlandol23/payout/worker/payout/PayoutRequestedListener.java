@@ -15,26 +15,25 @@ import org.springframework.stereotype.Component;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Consumes {@code payout.requested}.
+ * Consumes {@code payout.requested} and hands the payout to the processor.
  *
- * <p><strong>Day 2 does one thing: it reads the event, logs it and
- * acknowledges.</strong> No claim, no settlement, no retry. That is not an
- * oversight, it is the point of splitting the work: this commit proves the
- * transport, the contract and the acknowledgement, so day 3 can add settlement
- * to a pipe that is already known to be correct.
+ * <p><strong>The event is a nudge, not an instruction.</strong> All it carries
+ * that this listener uses is the payout id; everything the pipeline acts on is
+ * read from the row by the claim, because the row is the source of truth and the
+ * event may be a redelivery, a duplicate, or minutes stale. That is what makes
+ * the second delivery of a record a no-op rather than a second payment.
  *
- * <p>The acknowledgement is manual and immediate
- * ({@code spring.kafka.listener.ack-mode: manual_immediate}). Automatic commits
- * would advance the offset on a timer, independently of whether this method ever
- * ran, so a worker that crashed mid-settlement could come back to a payout Kafka
- * believes was handled. Manual acknowledgement makes the offset mean "the
- * listener finished", which is the only meaning worth having once there is real
- * work here.
+ * <p>The acknowledgement is manual and immediate, and it happens exactly once
+ * per record, on every path. A failure here is not retried by leaving the offset
+ * where it was: the row is still {@code PROCESSING} or {@code PENDING} and the
+ * claim scan will pick it up, whereas an unacknowledged record comes back
+ * immediately, fails the same way, and turns one broken payout into a consumer
+ * that stops making progress on the others.
  *
- * <p>The correlation id is taken from the record header rather than the body, so
- * it is available even for a record whose body did not deserialise, and it is
- * put in the MDC for the duration of the record so every line logged about this
- * payout carries the id the HTTP request that created it was logged under.
+ * <p>The correlation id comes from the record header rather than the body, so it
+ * is available even for a record that did not deserialise, and it is in the MDC
+ * for the whole handling: every line the settlement writes carries the id of the
+ * HTTP request that created the payout.
  */
 @Component
 public class PayoutRequestedListener {
@@ -47,13 +46,19 @@ public class PayoutRequestedListener {
      * <p>Every worker instance joins this one group, so Kafka hands each
      * partition to exactly one of them and adding instances divides the work
      * instead of duplicating it. A per-instance group would deliver every event
-     * to every worker, which for payouts is the duplicate payment the whole
-     * design exists to prevent.
+     * to every worker; the claim would still stop the double payment, but every
+     * instance but one would do nothing except lose a race.
      *
      * <p>Declared here rather than in {@code application.yml} so the listener and
      * its group are one thing to read and one thing to change.
      */
     static final String GROUP_ID = "payout-worker";
+
+    private final PayoutProcessor processor;
+
+    public PayoutRequestedListener(PayoutProcessor processor) {
+        this.processor = processor;
+    }
 
     @KafkaListener(topics = PayoutTopics.PAYOUT_REQUESTED, groupId = GROUP_ID)
     public void onPayoutRequested(
@@ -63,18 +68,18 @@ public class PayoutRequestedListener {
 
         MDC.put(CorrelationId.MDC_KEY, correlationIdFrom(correlationIdHeader));
         try {
-            log.info("Received {} for payout {}: {} {} requested at {}",
-                    PayoutTopics.PAYOUT_REQUESTED,
-                    event.payoutId(),
-                    event.amount(),
-                    event.currency(),
-                    event.requestedAt());
-
-            // Day 3 puts the atomic claim and the settlement call here. The
-            // acknowledgement stays where it is, after the work, because that is
-            // what makes the committed offset honest.
-            acknowledgment.acknowledge();
+            log.info("Received {} for payout {}", PayoutTopics.PAYOUT_REQUESTED, event.payoutId());
+            processor.claimAndProcess(event.payoutId());
+        } catch (RuntimeException failure) {
+            // Logged and swallowed rather than rethrown. The payout is safe
+            // either way: its row is still claimable, or still locked until the
+            // stale-lock timeout, and the scan is what recovers it. Rethrowing
+            // would replay this record until it succeeds, which for a payout the
+            // database cannot be reached for means never.
+            log.error("Handling {} for payout {} failed; the row is still the source of truth",
+                    PayoutTopics.PAYOUT_REQUESTED, event.payoutId(), failure);
         } finally {
+            acknowledgment.acknowledge();
             MDC.remove(CorrelationId.MDC_KEY);
         }
     }

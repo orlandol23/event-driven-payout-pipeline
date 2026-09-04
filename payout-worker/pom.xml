@@ -46,6 +46,25 @@
             <artifactId>spring-kafka</artifactId>
         </dependency>
 
+        <!--
+          JDBC, and deliberately not JPA. The worker reaches the payouts table
+          through one conditional UPDATE and nothing else, so it needs a
+          DataSource and a JdbcClient, not a persistence context and an entity
+          it could accidentally save. Leaving spring-boot-starter-data-jpa off
+          this classpath is what enforces the boundary the README describes:
+          there is no entity here to misuse, and no Flyway either, because the
+          API owns the schema and migrates it on start.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
