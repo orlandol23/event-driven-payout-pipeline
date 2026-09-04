@@ -1,5 +1,7 @@
 # payout-platform
 
+![CI](https://github.com/orlandol23/event-driven-payout-pipeline/actions/workflows/ci.yml/badge.svg)
+
 An asynchronous payout pipeline in Java 21 and Spring Boot 3: an HTTP edge that
 accepts payout requests, and a worker that settles them exactly once.
 
@@ -78,7 +80,7 @@ What is **not** implemented yet, despite being described above:
 | Atomic claim, retry with backoff, error taxonomy, dead letter topic | Day 3 |
 | Prometheus metrics, JSON logs, correlation id propagated over Kafka headers | Day 4 |
 | LLM backed endpoint | Day 4 |
-| CI, licence, AWS deployment design | Day 5 |
+| AWS deployment design | Day 5 |
 
 Other things this deliberately does not do, and will not by day 5:
 
@@ -268,6 +270,12 @@ cover the claims only a real database can confirm: that the migration applies,
 that the index is partial, that the check constraints reject bad rows written
 behind the API's back, and that concurrent requests collapse into one payout.
 
+### CI
+
+GitHub Actions runs `./mvnw -B verify` on every push and pull request (see
+`.github/workflows/ci.yml`). The runner has Docker available, so the
+Testcontainers integration tests run there rather than being skipped.
+
 ## Layout
 
 ```
@@ -342,8 +350,8 @@ Named here rather than discovered in review:
 - [ ] **Day 2** Kafka producer and consumer, keyed by payout id, manual commit
 - [ ] **Day 3** atomic claim, error taxonomy, backoff, dead letter topic
 - [ ] **Day 4** Actuator, Micrometer, Prometheus, JSON logs, LLM endpoint
-- [ ] **Day 5** CI, licence, AWS deployment design, study guide
+- [ ] **Day 5** AWS deployment design, study guide (CI and the licence are done)
 
 ## Licence
 
-To be added on day 5.
+MIT, see [LICENSE](LICENSE).
