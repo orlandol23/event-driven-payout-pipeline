@@ -1,5 +1,8 @@
 package io.github.orlandol23.payout.api.payout;
 
+import io.github.orlandol23.payout.api.payout.events.PayoutEventPublisher;
+import io.github.orlandol23.payout.contracts.PayoutRequested;
+import io.github.orlandol23.payout.contracts.PayoutTopics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -17,14 +20,16 @@ public class PayoutService {
     private static final Logger log = LoggerFactory.getLogger(PayoutService.class);
 
     private final PayoutRepository repository;
+    private final PayoutEventPublisher eventPublisher;
     private final Clock clock;
 
     /**
      * Constructor injection, so the dependencies are final, the object cannot
      * exist half built, and a unit test can construct it with no Spring context.
      */
-    public PayoutService(PayoutRepository repository, Clock clock) {
+    public PayoutService(PayoutRepository repository, PayoutEventPublisher eventPublisher, Clock clock) {
         this.repository = repository;
+        this.eventPublisher = eventPublisher;
         this.clock = clock;
     }
 
@@ -44,6 +49,11 @@ public class PayoutService {
      * request can slip in. The lookup below is a fast path that avoids a
      * guaranteed-to-fail insert in the common replay case; correctness comes from
      * {@code ux_payouts_idempotency_key} and the catch block, not from the check.
+     *
+     * <p>A {@code payout.requested} event is published only for a payout this
+     * call actually created. A replay publishes nothing: the first call already
+     * did, and a second event would hand the worker a second unit of work for a
+     * payout that has one.
      */
     public PayoutCreation create(CreatePayoutCommand command) {
         if (command.idempotencyKey() != null) {
@@ -70,9 +80,44 @@ public class PayoutService {
             // instead of at some later commit outside this method.
             Payout created = repository.saveAndFlush(payout);
             log.info("Created payout {} for {} {}", created.getId(), created.getAmount(), created.getCurrency());
+            announce(created);
             return PayoutCreation.created(created);
         } catch (DataIntegrityViolationException violation) {
             return recoverFromLostRace(command, violation);
+        }
+    }
+
+    /**
+     * Publishes {@code payout.requested} after the row is durable, and never
+     * fails the request if that publish does not work.
+     *
+     * <p><strong>There is no outbox yet, and this is where that shows.</strong>
+     * The insert is committed and the publish is a separate, non-transactional
+     * call, so a broker that is down between the two leaves a {@code PENDING}
+     * row with no event. The API still answers 201, which stays truthful: 201
+     * means the request is durable and queued, and the row <em>is</em> the
+     * queue. Nothing republishes the event; day 3's claim scan reads
+     * {@code payouts} directly and picks the row up, which is what makes Kafka a
+     * latency optimisation here rather than the source of truth.
+     *
+     * <p>Publishing before the commit would be worse in the direction that
+     * matters: the worker could receive an event for a row that never lands.
+     * Losing an event only delays a payout that the database still knows about.
+     */
+    private void announce(Payout created) {
+        try {
+            eventPublisher.publish(new PayoutRequested(
+                    created.getId(),
+                    created.getAmount(),
+                    created.getCurrency(),
+                    created.getCorrelationId(),
+                    created.getCreatedAt()));
+        } catch (RuntimeException failure) {
+            // Caught here rather than left to the publisher, because this is the
+            // boundary that must not fail: a broker problem is not a client
+            // error and must not turn a durable payout into a 500.
+            log.error("Payout {} is durable but its {} event was not published [correlationId={}]",
+                    created.getId(), PayoutTopics.PAYOUT_REQUESTED, created.getCorrelationId(), failure);
         }
     }
 

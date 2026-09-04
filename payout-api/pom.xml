@@ -15,6 +15,17 @@
     <description>Synchronous edge: accepts payout requests, persists them as PENDING</description>
 
     <dependencies>
+        <!--
+          The wire contract, shared with payout-worker. Version comes from the
+          reactor, so a change to the event shape breaks both services'
+          compilation in the same build rather than at runtime in production.
+        -->
+        <dependency>
+            <groupId>io.github.orlandol23</groupId>
+            <artifactId>payout-contracts</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
@@ -30,6 +41,12 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- Version managed by the Spring Boot BOM in the aggregator POM. -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
         </dependency>
 
         <dependency>
@@ -51,6 +68,16 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!--
+          An in-JVM KRaft broker, so the producer is tested against real Kafka
+          wire behaviour on a machine with no Docker. Testcontainers covers the
+          database; this covers the broker.
+        -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>

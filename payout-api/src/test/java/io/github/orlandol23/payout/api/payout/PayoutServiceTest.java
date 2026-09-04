@@ -1,5 +1,7 @@
 package io.github.orlandol23.payout.api.payout;
 
+import io.github.orlandol23.payout.api.payout.events.PayoutEventPublisher;
+import io.github.orlandol23.payout.contracts.PayoutRequested;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -9,6 +11,7 @@ import org.mockito.Captor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.kafka.KafkaException;
 
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -20,8 +23,10 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -45,14 +50,20 @@ class PayoutServiceTest {
     @Mock
     private PayoutRepository repository;
 
+    @Mock
+    private PayoutEventPublisher eventPublisher;
+
     @Captor
     private ArgumentCaptor<Payout> payoutCaptor;
+
+    @Captor
+    private ArgumentCaptor<PayoutRequested> eventCaptor;
 
     private PayoutService service;
 
     private PayoutService service() {
         if (service == null) {
-            service = new PayoutService(repository, FIXED_CLOCK);
+            service = new PayoutService(repository, eventPublisher, FIXED_CLOCK);
         }
         return service;
     }
@@ -166,6 +177,81 @@ class PayoutServiceTest {
             assertThatThrownBy(() -> service().create(command(new BigDecimal("125.50"), "BRL", null)))
                     .isInstanceOf(DataIntegrityViolationException.class);
             verify(repository, never()).findByIdempotencyKey(any());
+        }
+    }
+
+    /**
+     * Who gets told about a new payout, and what happens when telling them
+     * fails.
+     *
+     * <p>Mocked rather than run against a broker on purpose: these are decisions
+     * the service makes, and "the broker was unreachable" is not something an
+     * embedded Kafka reproduces on demand. That the event reaches the topic
+     * correctly is {@code PayoutEventPublisherTest}'s job.
+     */
+    @Nested
+    @DisplayName("publishing payout.requested")
+    class Publishing {
+
+        @Test
+        @DisplayName("publishes exactly once for a payout this call created")
+        void publishesOnceForANewPayout() {
+            when(repository.saveAndFlush(any(Payout.class))).thenAnswer(call -> call.getArgument(0));
+
+            PayoutCreation creation = service().create(command(new BigDecimal("125.50"), "BRL", IDEMPOTENCY_KEY));
+
+            verify(eventPublisher).publish(eventCaptor.capture());
+            PayoutRequested event = eventCaptor.getValue();
+
+            assertThat(event.payoutId()).isEqualTo(creation.payout().getId());
+            assertThat(event.amount()).isEqualByComparingTo("125.5000");
+            assertThat(event.currency()).isEqualTo("BRL");
+            assertThat(event.correlationId()).isEqualTo(CORRELATION_ID);
+            assertThat(event.requestedAt()).isEqualTo(NOW);
+        }
+
+        @Test
+        @DisplayName("publishes nothing for a replay, because the first request already did")
+        void publishesNothingForAReplay() {
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY)).thenReturn(Optional.of(existingPayout()));
+
+            service().create(command(new BigDecimal("125.50"), "BRL", IDEMPOTENCY_KEY));
+
+            verifyNoInteractions(eventPublisher);
+        }
+
+        @Test
+        @DisplayName("publishes nothing after losing the insert race, for the same reason")
+        void publishesNothingAfterLosingTheRace() {
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY))
+                    .thenReturn(Optional.empty())
+                    .thenReturn(Optional.of(existingPayout()));
+            when(repository.saveAndFlush(any(Payout.class)))
+                    .thenThrow(new DataIntegrityViolationException("ux_payouts_idempotency_key"));
+
+            service().create(command(new BigDecimal("125.50"), "BRL", IDEMPOTENCY_KEY));
+
+            verifyNoInteractions(eventPublisher);
+        }
+
+        /**
+         * The honest half of having no outbox. A broker that is down must not
+         * turn a durable payout into a 500: the row is the queue, and day 3's
+         * claim scan finds it whether the event was published or not.
+         */
+        @Test
+        @DisplayName("a broker failure does not fail the request, because the row is already durable")
+        void aPublishFailureDoesNotFailCreate() {
+            when(repository.saveAndFlush(any(Payout.class))).thenAnswer(call -> call.getArgument(0));
+            doThrow(new KafkaException("no broker available")).when(eventPublisher).publish(any());
+
+            // No assertThatCode wrapper: if the failure escaped, this line throws
+            // and the test fails, which is the assertion.
+            PayoutCreation creation = service().create(command(new BigDecimal("125.50"), "BRL", IDEMPOTENCY_KEY));
+
+            assertThat(creation.replayed()).as("still a 201, not a replay").isFalse();
+            assertThat(creation.payout().getStatus()).isEqualTo(PayoutStatus.PENDING);
+            verify(eventPublisher).publish(any());
         }
     }
 

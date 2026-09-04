@@ -39,6 +39,41 @@ spring:
         query:
           fail_on_pagination_over_collection_fetch: true
 
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # Every in-sync replica must have the record before the broker
+      # acknowledges it. acks=1 loses records when the leader dies before the
+      # followers catch up, which for a payout means a request the caller was
+      # told we accepted and nobody is going to settle.
+      acks: all
+      properties:
+        # Exactly-once semantics per partition for the producer itself: the
+        # broker deduplicates a retried batch by sequence number, so a retry
+        # after a timeout cannot put the same event on the topic twice. Free
+        # since Kafka 3.0 and pointless to leave off.
+        enable.idempotence: true
+
+        # The two settings that keep a dead broker out of the HTTP request.
+        # max.block.ms bounds how long send() waits for metadata or for buffer
+        # space before it throws; without it the default is 60 seconds of a
+        # request thread parked on a broker that is not coming back.
+        max.block.ms: 5000
+        # delivery.timeout.ms bounds the whole asynchronous attempt, retries
+        # included. Kafka requires it to be at least request.timeout.ms +
+        # linger.ms, so request.timeout.ms comes down with it; leaving the
+        # 30 second default would make the producer refuse to start.
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+
+        # No __TypeId__ header. The consumer is told what type to expect by its
+        # own configuration, so shipping our class name on the wire would only
+        # couple the consumer to our package layout and break it the day this
+        # class moves.
+        spring.json.add.type.headers: false
+
   # Left off. This advice class builds the problem documents by hand so it can
   # attach the correlation id and the per-field errors; enabling both would mean
   # two mechanisms competing for the same responses.
@@ -49,8 +84,8 @@ spring:
   threads:
     virtual:
       # Java 21 virtual threads for request handling. Payout requests are
-      # IO bound on PostgreSQL and, from day 2, on Kafka, which is precisely the
-      # workload where a platform thread per request is wasted memory.
+      # IO bound on PostgreSQL and on Kafka, which is precisely the workload
+      # where a platform thread per request is wasted memory.
       enabled: true
 
 server:

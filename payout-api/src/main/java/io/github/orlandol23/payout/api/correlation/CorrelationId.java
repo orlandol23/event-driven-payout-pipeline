@@ -8,9 +8,9 @@ import java.util.regex.Pattern;
  * the provider.
  *
  * <p>The same id ends up in the log MDC, in the {@code payouts} row, in the
- * error response body and, from day 4, in a Kafka header, so that one value
- * follows a payout from the HTTP request that created it all the way to the
- * worker that settles it.
+ * error response body and in the {@code payout.requested} record header, so that
+ * one value follows a payout from the HTTP request that created it all the way
+ * to the worker that settles it.
  */
 public final class CorrelationId {
 

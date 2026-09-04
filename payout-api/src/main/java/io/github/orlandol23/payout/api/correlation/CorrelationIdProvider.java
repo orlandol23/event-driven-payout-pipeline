@@ -8,8 +8,8 @@ import org.springframework.stereotype.Component;
  *
  * <p>A one-line bean around a static MDC lookup, so callers depend on an
  * injected collaborator they can stub instead of reaching into a thread local
- * themselves. On day 4 the worker gets its own implementation that reads the id
- * from a Kafka header, and nothing that consumes this has to change.
+ * themselves. The worker fills the same MDC key from the {@code payout.requested}
+ * record header, so a log line either side of the broker reads the same.
  */
 @Component
 public class CorrelationIdProvider {
