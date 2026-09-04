@@ -1,12 +1,10 @@
-# Local development stack.
-#
-# Day 1 runs PostgreSQL only. The Kafka broker and Kafka UI land on day 2; the
-# network, the healthcheck convention and the .env driven configuration below are
-# already shaped to take them without restructuring anything.
+# Local development stack: PostgreSQL, a single node Kafka broker and a UI to
+# look inside it.
 #
 #   cp .env.example .env
 #   docker compose up -d
 #   mvn -pl payout-api spring-boot:run
+#   mvn -pl payout-worker spring-boot:run
 
 name: payout-platform
 
@@ -32,8 +30,8 @@ services:
     healthcheck:
       # Depending on the port being open is not enough: PostgreSQL accepts
       # connections briefly during init and then restarts. pg_isready against the
-      # real database and user is the honest check, and it is what lets the
-      # services added on day 2 wait for a database that is actually usable.
+      # real database and user is the honest check, and it is what lets other
+      # services wait for a database that is actually usable.
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-payout} -d ${POSTGRES_DB:-payout}"]
       interval: 5s
       timeout: 5s
@@ -42,12 +40,90 @@ services:
     networks:
       - payout-net
 
-  # ---------------------------------------------------------------------------
-  # Day 2 adds here:
-  #   kafka     a KRaft mode broker, no ZooKeeper
-  #   kafka-ui  to inspect payout.requested and the dead letter topic
-  # Both join payout-net and follow the same healthcheck and .env conventions.
-  # ---------------------------------------------------------------------------
+  kafka:
+    # KRaft mode: one process is both broker and controller, and there is no
+    # ZooKeeper. Pinned to 3.9.2 because that is the kafka-clients version the
+    # Spring Boot 3.5 BOM brings in, so local development talks to the same
+    # broker version the tests were compiled against.
+    image: apache/kafka:3.9.2
+    container_name: payout-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,HOST:PLAINTEXT,INTERNAL:PLAINTEXT
+      # Three listeners, because there are three kinds of client and they do not
+      # agree on what this broker is called. HOST is for the API and the worker
+      # running on the laptop, which reach it as localhost. INTERNAL is for
+      # containers on payout-net, which reach it as kafka. CONTROLLER is the
+      # raft quorum talking to itself. Advertising one address for all three is
+      # the classic Kafka-in-Docker failure: metadata says "kafka:9092", the
+      # laptop cannot resolve that, and the producer times out with no useful
+      # error.
+      KAFKA_LISTENERS: HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:${KAFKA_PORT:-9092},INTERNAL://kafka:19092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # One node, so nothing can be replicated more than once. These are the
+      # settings that make a single node broker start at all; a real cluster
+      # runs three and none of these lines.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # No rebalance delay: a worker restarting locally should pick its
+      # partitions straight back up instead of waiting three seconds.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Three partitions for anything auto-created, so keyed partitioning is
+      # visible locally instead of degenerating to a single partition where
+      # every ordering bug is hidden. Production creates topics deliberately
+      # with auto-creation off; a laptop does not need the ceremony.
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # A fixed cluster id, so a restarted broker is the same cluster. Must be a
+      # url-safe base64 UUID; kafka-storage format rejects anything else.
+      CLUSTER_ID: f50cLjpLTF2Ob6CxwtPk9Q
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    # No volume, deliberately. The broker's log is scratch here: the payouts
+    # table is the durable copy of every request, which is the same argument the
+    # README makes for Kafka being a latency optimisation rather than the source
+    # of truth. A wiped local broker costs nothing.
+    healthcheck:
+      # Same reasoning as pg_isready: an open port means the JVM is up, not that
+      # the broker is serving metadata. Asking it for API versions is the
+      # cheapest request that only a usable broker can answer, and it is what
+      # lets kafka-ui wait for something real.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks:
+      - payout-net
+
+  kafka-ui:
+    # Read only in practice, and only ever pointed at this local broker: it is
+    # here to look at payout.requested, its partitions and its consumer group
+    # lag while developing, not to administer anything.
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: payout-kafka-ui
+    restart: unless-stopped
+    environment:
+      KAFKA_CLUSTERS_0_NAME: payout-local
+      # Reached over payout-net, so the internal listener, not localhost.
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      DYNAMIC_CONFIG_ENABLED: "false"
+    ports:
+      - "${KAFKA_UI_PORT:-8090}:8080"
+    depends_on:
+      kafka:
+        # Not just "started". kafka-ui polls on boot and caches a failure, so
+        # starting it against a broker that is not serving yet leaves a UI that
+        # says the cluster is offline until it is restarted.
+        condition: service_healthy
+    networks:
+      - payout-net
 
 volumes:
   postgres-data:
