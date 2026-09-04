@@ -78,8 +78,8 @@ spring:
       # The listener acknowledges each record itself, and the commit goes to the
       # broker straight away rather than at the end of the poll batch. The
       # committed offset therefore means "the listener finished with this
-      # record", which is the only interpretation that stays true once day 3
-      # settles money in there.
+      # record", which is the only interpretation that stays true now that the
+      # listener settles payouts rather than logging them.
       ack-mode: manual_immediate
 
 payout:

@@ -325,8 +325,8 @@ class PayoutServiceTest {
 
         /**
          * The honest half of having no outbox. A broker that is down must not
-         * turn a durable payout into a 500: the row is the queue, and day 3's
-         * claim scan finds it whether the event was published or not.
+         * turn a durable payout into a 500: the row is the queue, and the
+         * worker's claim scan finds it whether the event was published or not.
          */
         @Test
         @DisplayName("a broker failure does not fail the request, because the row is already durable")

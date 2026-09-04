@@ -121,7 +121,7 @@ public class PayoutService {
      * call, so a broker that is down between the two leaves a {@code PENDING}
      * row with no event. The API still answers 201, which stays truthful: 201
      * means the request is durable and queued, and the row <em>is</em> the
-     * queue. Nothing republishes the event; day 3's claim scan reads
+     * queue. Nothing republishes the event; the worker's claim scan reads
      * {@code payouts} directly and picks the row up, which is what makes Kafka a
      * latency optimisation here rather than the source of truth.
      *

@@ -17,9 +17,9 @@ public final class PayoutTopics {
     /**
      * Where a {@code payout.requested} event goes when it can never succeed.
      *
-     * <p>Reserved now, used on day 3. It is declared here rather than invented
-     * later so the name is decided once, next to the topic it shadows, instead
-     * of being coined twice under pressure.
+     * <p>The worker publishes here when a payout is rejected permanently or has
+     * exhausted its attempts. Declared next to the topic it shadows so the name
+     * is decided once, rather than coined twice under pressure.
      */
     public static final String PAYOUT_REQUESTED_DLT = "payout.requested.dlt";
 

@@ -61,8 +61,9 @@ public class PayoutEventPublisher {
         kafkaTemplate.send(record).whenComplete((result, failure) -> {
             if (failure != null) {
                 // ERROR, not WARN: the row is durable but nothing is listening
-                // for it until day 3's claim scan, so this is a real delay to a
-                // real payout and someone should be paged for a burst of them.
+                // for it until the worker's claim scan comes round, so this is a
+                // real delay to a real payout and someone should be paged for a
+                // burst of them.
                 log.error("Failed to publish {} for payout {} [correlationId={}]",
                         PayoutTopics.PAYOUT_REQUESTED, event.payoutId(), event.correlationId(), failure);
                 return;
