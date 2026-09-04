@@ -76,6 +76,44 @@
             <artifactId>spring-kafka-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!--
+          A real PostgreSQL for PayoutWorkerIT. The claim is a conditional UPDATE
+          racing other transactions, and FOR UPDATE SKIP LOCKED has no meaning
+          outside a database that implements it, so the one part of this module
+          that cannot be tested in memory is tested against the real thing.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!--
+          Test scope only, and only so the integration test can apply the API's
+          migrations to its own container. The worker itself never migrates
+          anything: the API owns the schema, which is why this is not a runtime
+          dependency.
+        -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

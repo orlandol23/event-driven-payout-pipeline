@@ -4,6 +4,7 @@ import io.github.orlandol23.payout.api.config.ClockConfig;
 import io.github.orlandol23.payout.api.correlation.CorrelationId;
 import io.github.orlandol23.payout.api.correlation.CorrelationIdProvider;
 import io.github.orlandol23.payout.api.payout.CreatePayoutCommand;
+import io.github.orlandol23.payout.api.payout.IdempotencyKeyReusedException;
 import io.github.orlandol23.payout.api.payout.Payout;
 import io.github.orlandol23.payout.api.payout.PayoutCreation;
 import io.github.orlandol23.payout.api.payout.PayoutNotFoundException;
@@ -25,8 +26,10 @@ import java.time.Instant;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.matchesPattern;
+import static org.hamcrest.Matchers.not;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.willThrow;
@@ -189,6 +192,36 @@ class PayoutControllerTest {
                                     """))
                     .andExpect(status().isBadRequest())
                     .andExpect(jsonPath("$.type").value("urn:payout:error:validation-failed"));
+        }
+
+        @Test
+        @DisplayName("answers 422 when the idempotency key was already used for a different request")
+        void answersUnprocessableOnIdempotencyMismatch() throws Exception {
+            UUID existing = UUID.randomUUID();
+            willThrow(new IdempotencyKeyReusedException("key-1", existing))
+                    .given(payoutService).create(any());
+
+            mockMvc.perform(post("/payouts")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .header(PayoutController.IDEMPOTENCY_KEY_HEADER, "key-1")
+                            .content("""
+                                    {"amount": 999.99, "currency": "USD"}
+                                    """))
+                    // 422, not 409: the request is understood and will fail the
+                    // same way forever, so a retry is not the answer.
+                    .andExpect(status().isUnprocessableEntity())
+                    .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                    .andExpect(jsonPath("$.type").value("urn:payout:error:idempotency-mismatch"))
+                    .andExpect(jsonPath("$.title").value("Idempotency key reused"))
+                    .andExpect(jsonPath("$.status").value(422))
+                    .andExpect(jsonPath("$.instance").value("/payouts"))
+                    .andExpect(jsonPath("$.correlationId").exists())
+                    .andExpect(jsonPath("$.timestamp").exists())
+                    // Neither the key nor the winning payout id is echoed back:
+                    // the caller knows its own key, and the id belongs to the
+                    // earlier request.
+                    .andExpect(content().string(not(containsString(existing.toString()))))
+                    .andExpect(content().string(not(containsString("key-1"))));
         }
 
         @Test

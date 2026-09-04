@@ -12,6 +12,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.kafka.KafkaException;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -181,6 +182,94 @@ class PayoutServiceTest {
     }
 
     /**
+     * The promise an idempotency key makes, and what happens when a caller
+     * breaks it.
+     *
+     * <p>A key says "this is the same request again". The fingerprint is what
+     * lets the service check rather than assume, and the three cases below are
+     * the only three there are: same request, different request, and a row from
+     * before the column existed.
+     */
+    @Nested
+    @DisplayName("idempotency key reuse")
+    class KeyReuse {
+
+        @Test
+        @DisplayName("the same key with the same body is a replay, as it always was")
+        void sameBodyStillReplays() {
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY)).thenReturn(Optional.of(existingPayout()));
+
+            PayoutCreation creation = service().create(command(new BigDecimal("125.50"), "BRL", IDEMPOTENCY_KEY));
+
+            assertThat(creation.replayed()).isTrue();
+        }
+
+        @Test
+        @DisplayName("trailing zeros are not a different request")
+        void scaleDoesNotMakeItADifferentRequest() {
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY)).thenReturn(Optional.of(existingPayout()));
+
+            PayoutCreation creation = service().create(command(new BigDecimal("125.5"), "BRL", IDEMPOTENCY_KEY));
+
+            assertThat(creation.replayed()).isTrue();
+        }
+
+        @Test
+        @DisplayName("the same key with a different amount is rejected, not answered with the first payout")
+        void differentAmountIsRejected() {
+            Payout existing = existingPayout();
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY)).thenReturn(Optional.of(existing));
+
+            assertThatThrownBy(() -> service().create(command(new BigDecimal("999.99"), "BRL", IDEMPOTENCY_KEY)))
+                    .isInstanceOf(IdempotencyKeyReusedException.class)
+                    .extracting(failure -> ((IdempotencyKeyReusedException) failure).getExistingPayoutId())
+                    .isEqualTo(existing.getId());
+            verify(repository, never()).saveAndFlush(any());
+            verifyNoInteractions(eventPublisher);
+        }
+
+        @Test
+        @DisplayName("the same key with a different currency is rejected too")
+        void differentCurrencyIsRejected() {
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY)).thenReturn(Optional.of(existingPayout()));
+
+            assertThatThrownBy(() -> service().create(command(new BigDecimal("125.50"), "USD", IDEMPOTENCY_KEY)))
+                    .isInstanceOf(IdempotencyKeyReusedException.class);
+        }
+
+        @Test
+        @DisplayName("a row created before V2 has no fingerprint, and unknown is not the same as different")
+        void aRowWithoutAFingerprintStillReplays() {
+            // Failing every replay of every pre-migration payout would be a
+            // migration turning into an outage.
+            Payout legacy = payoutWithoutFingerprint();
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY)).thenReturn(Optional.of(legacy));
+
+            PayoutCreation creation = service().create(command(new BigDecimal("999.99"), "USD", IDEMPOTENCY_KEY));
+
+            assertThat(creation.replayed()).isTrue();
+            assertThat(creation.payout()).isSameAs(legacy);
+        }
+
+        @Test
+        @DisplayName("losing the insert race to a different body is rejected, not silently replayed")
+        void theRaceLoserIsCheckedToo() {
+            // Two concurrent requests with one key and two bodies are the same
+            // mistake as two sequential ones. The loser must not be the only
+            // caller that gets away with it.
+            when(repository.findByIdempotencyKey(IDEMPOTENCY_KEY))
+                    .thenReturn(Optional.empty())
+                    .thenReturn(Optional.of(existingPayout()));
+            when(repository.saveAndFlush(any(Payout.class)))
+                    .thenThrow(new DataIntegrityViolationException("ux_payouts_idempotency_key"));
+
+            assertThatThrownBy(() -> service().create(command(new BigDecimal("1.00"), "BRL", IDEMPOTENCY_KEY)))
+                    .isInstanceOf(IdempotencyKeyReusedException.class);
+            verifyNoInteractions(eventPublisher);
+        }
+    }
+
+    /**
      * Who gets told about a new payout, and what happens when telling them
      * fails.
      *
@@ -288,5 +377,19 @@ class PayoutServiceTest {
     private static Payout existingPayout() {
         return Payout.request(UUID.randomUUID(), IDEMPOTENCY_KEY, new BigDecimal("125.5000"), "BRL",
                 CORRELATION_ID, NOW);
+    }
+
+    /**
+     * A payout as it comes back from a row written before V2 added the column.
+     *
+     * <p>The field is cleared reflectively rather than by adding a setter,
+     * because nothing in production should be able to take a fingerprint off a
+     * payout. This is the one state the entity cannot construct and the database
+     * still contains.
+     */
+    private static Payout payoutWithoutFingerprint() {
+        Payout legacy = existingPayout();
+        ReflectionTestUtils.setField(legacy, "idempotencyFingerprint", null);
+        return legacy;
     }
 }

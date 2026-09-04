@@ -146,7 +146,49 @@ class PayoutApiIT {
         List<String> applied = jdbcTemplate.queryForList(
                 "SELECT script FROM flyway_schema_history WHERE success ORDER BY installed_rank", String.class);
 
-        assertThat(applied).contains("V1__create_payouts_table.sql");
+        assertThat(applied).contains("V1__create_payouts_table.sql", "V2__payouts_claim_columns.sql");
+    }
+
+    @Test
+    @DisplayName("V2 added the columns the worker claims with, and Hibernate is happy not to map them all")
+    void claimColumnsExist() {
+        // next_attempt_at is mapped read only, locked_at is not mapped at all,
+        // and the context started anyway: ddl-auto=validate asserts that mapped
+        // columns exist, not that every column is mapped.
+        List<String> columns = jdbcTemplate.queryForList("""
+                SELECT column_name FROM information_schema.columns
+                 WHERE table_name = 'payouts'
+                """, String.class);
+
+        assertThat(columns).contains("next_attempt_at", "locked_at", "idempotency_fingerprint");
+    }
+
+    @Test
+    @DisplayName("the claim scan index orders by created_at, so 'oldest claimable first' is not a sort")
+    void claimScanIndexIsOrderedAndPartial() {
+        String definition = jdbcTemplate.queryForObject(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_payouts_claimable'", String.class);
+
+        assertThat(definition)
+                // created_at is the only key column, so the scan reads the index
+                // in order and stops at the batch limit instead of sorting two
+                // status groups. Status moved into the predicate, where it also
+                // keeps CONFIRMED and FAILED rows out of the index forever.
+                .contains("(created_at)")
+                .contains("WHERE")
+                .contains("PENDING")
+                .contains("PROCESSING");
+    }
+
+    @Test
+    @DisplayName("the database refuses a lock on a row that is not being processed")
+    void checkConstraintRejectsALockOutsideProcessing() {
+        assertThatThrownBy(() -> jdbcTemplate.update("""
+                INSERT INTO payouts (id, amount, currency, status, correlation_id, attempts,
+                                     locked_at, created_at, updated_at)
+                VALUES (?, 10.0000, 'USD', 'PENDING', 'corr', 0, now(), now(), now())
+                """, UUID.randomUUID()))
+                .isInstanceOf(DataIntegrityViolationException.class);
     }
 
     @Test
@@ -209,6 +251,10 @@ class PayoutApiIT {
         assertThat(read.getBody().get("currency").asText()).isEqualTo("BRL");
         assertThat(read.getBody().get("attempts").asInt()).isZero();
         assertThat(read.getBody().get("lastError").isNull()).isTrue();
+        // Exposed so a caller polling a retried payout can see when the next
+        // attempt is due rather than guessing at the backoff. Null here, because
+        // a payout nobody has tried yet is claimable now.
+        assertThat(read.getBody().get("nextAttemptAt").isNull()).isTrue();
     }
 
     @Test
@@ -270,6 +316,44 @@ class PayoutApiIT {
         // 200 rather than 201: the retry succeeded, but it did not create anything.
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(second.getBody().get("id").asText()).isEqualTo(first.getBody().get("id").asText());
+        assertThat(countPayouts()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("reusing a key with a different body is 422, not the first payout answered with a 200")
+    void reusingAKeyWithADifferentBodyIsRejected() {
+        String key = "order-" + UUID.randomUUID();
+
+        ResponseEntity<JsonNode> first = post("""
+                {"amount": 250.00, "currency": "BRL"}
+                """, key, null);
+        ResponseEntity<JsonNode> reused = post("""
+                {"amount": 999.99, "currency": "BRL"}
+                """, key, null);
+
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(reused.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(reused.getHeaders().getContentType()).isEqualTo(MediaType.APPLICATION_PROBLEM_JSON);
+        assertThat(reused.getBody().get("type").asText()).isEqualTo("urn:payout:error:idempotency-mismatch");
+        assertThat(reused.getBody().get("correlationId").asText()).isNotBlank();
+        // The first payout is untouched: no second row, and no second event.
+        assertThat(countPayouts()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("a key replayed with a differently scaled but identical amount is still a replay")
+    void amountScaleDoesNotBreakAReplay() {
+        String key = "order-" + UUID.randomUUID();
+
+        ResponseEntity<JsonNode> first = post("""
+                {"amount": 250.00, "currency": "BRL"}
+                """, key, null);
+        ResponseEntity<JsonNode> replay = post("""
+                {"amount": 250, "currency": "BRL"}
+                """, key, null);
+
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(replay.getBody().get("id").asText()).isEqualTo(first.getBody().get("id").asText());
         assertThat(countPayouts()).isEqualTo(1);
     }
 

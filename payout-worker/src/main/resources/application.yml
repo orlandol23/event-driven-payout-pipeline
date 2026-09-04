@@ -10,17 +10,25 @@ spring:
     # fresh clone runs with no setup. Sharing it is the design, not an accident:
     # the queue is a table and the claim is a conditional UPDATE against it.
     #
-    # There is no spring.flyway section and no flyway on this classpath. The API
-    # owns the schema and migrates it on start; a second service running the same
-    # migrations is a race at deploy time for no benefit. If the worker starts
-    # against a database the API has not migrated yet, its statements fail and
-    # the rows stay claimable until it has.
     url: ${PAYOUT_DB_URL:jdbc:postgresql://localhost:5432/payout}
     username: ${PAYOUT_DB_USERNAME:payout}
     password: ${PAYOUT_DB_PASSWORD:payout}
     hikari:
       pool-name: payout-worker-pool
       maximum-pool-size: ${PAYOUT_DB_POOL_SIZE:10}
+
+  flyway:
+    # Off, and said out loud rather than left to the absence of a dependency.
+    # The API owns the schema and migrates it on start; two services running the
+    # same migrations is a race at deploy time for no benefit. A worker that
+    # starts against a database the API has not migrated yet fails its
+    # statements and the rows stay claimable until it has.
+    #
+    # Flyway is on this module's classpath at test scope only, so the
+    # integration test can apply the API's migrations to its own container.
+    # Without this line, auto-configuration would take that as permission to
+    # migrate on every start.
+    enabled: false
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
