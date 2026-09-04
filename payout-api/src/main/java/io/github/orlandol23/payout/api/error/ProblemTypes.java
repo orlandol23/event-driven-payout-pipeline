@@ -30,6 +30,15 @@ public final class ProblemTypes {
     /** The request collided with existing state. */
     public static final URI CONFLICT = URI.create(PREFIX + "conflict");
 
+    /**
+     * The {@code Idempotency-Key} was already used for a different request.
+     *
+     * <p>Its own type rather than {@code conflict}, because the two need
+     * different handling. A conflict is worth retrying; this one never is, and a
+     * client that cannot tell them apart will retry forever.
+     */
+    public static final URI IDEMPOTENCY_MISMATCH = URI.create(PREFIX + "idempotency-mismatch");
+
     /** Anything unhandled. Details are logged, never returned. */
     public static final URI INTERNAL_ERROR = URI.create(PREFIX + "internal-error");
 

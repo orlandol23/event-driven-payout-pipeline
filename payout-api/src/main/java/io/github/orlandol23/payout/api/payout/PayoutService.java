@@ -59,9 +59,7 @@ public class PayoutService {
         if (command.idempotencyKey() != null) {
             Optional<Payout> alreadyCreated = repository.findByIdempotencyKey(command.idempotencyKey());
             if (alreadyCreated.isPresent()) {
-                Payout existing = alreadyCreated.get();
-                log.info("Replaying payout {} for idempotency key {}", existing.getId(), command.idempotencyKey());
-                return PayoutCreation.replayed(existing);
+                return replay(alreadyCreated.get(), command);
             }
         }
 
@@ -85,6 +83,33 @@ public class PayoutService {
         } catch (DataIntegrityViolationException violation) {
             return recoverFromLostRace(command, violation);
         }
+    }
+
+    /**
+     * Hands back the payout an idempotency key already created, but only if the
+     * request behind the key has not changed.
+     *
+     * <p>An idempotency key says "this is the same request again". Returning the
+     * first payout for a request that is not the same one would answer 200 with
+     * a payout for an amount the caller never asked for, and the caller would
+     * have no way of noticing. A 422 says the key is spent on something else.
+     *
+     * <p>A null fingerprint means the row predates V2, so there is nothing to
+     * compare against. Unknown is not the same as different: the replay goes
+     * through, exactly as it did before the column existed. The alternative
+     * would be to fail every replay of every pre-migration payout, which is a
+     * migration turning into an outage.
+     */
+    private PayoutCreation replay(Payout existing, CreatePayoutCommand command) {
+        String fingerprint = IdempotencyFingerprint.of(command.amount(), command.currency());
+        if (existing.getIdempotencyFingerprint() != null
+                && !existing.getIdempotencyFingerprint().equals(fingerprint)) {
+            log.warn("Idempotency key {} was already used for payout {} with a different request",
+                    command.idempotencyKey(), existing.getId());
+            throw new IdempotencyKeyReusedException(command.idempotencyKey(), existing.getId());
+        }
+        log.info("Replaying payout {} for idempotency key {}", existing.getId(), command.idempotencyKey());
+        return PayoutCreation.replayed(existing);
     }
 
     /**
@@ -128,6 +153,11 @@ public class PayoutService {
      * callers get the same payout. If the re-read finds nothing, the violation
      * came from some other constraint and hiding it would be a bug, so it is
      * rethrown untouched.
+     *
+     * <p>The winner goes through the same fingerprint check as any other replay.
+     * Two concurrent requests carrying one key and two different bodies are the
+     * same mistake as two sequential ones, and the loser of the race must not be
+     * the only caller that gets away with it.
      */
     private PayoutCreation recoverFromLostRace(CreatePayoutCommand command,
                                                DataIntegrityViolationException violation) {
@@ -138,7 +168,7 @@ public class PayoutService {
                 .map(winner -> {
                     log.info("Lost insert race for idempotency key {}, returning payout {}",
                             command.idempotencyKey(), winner.getId());
-                    return PayoutCreation.replayed(winner);
+                    return replay(winner, command);
                 })
                 .orElseThrow(() -> violation);
     }
