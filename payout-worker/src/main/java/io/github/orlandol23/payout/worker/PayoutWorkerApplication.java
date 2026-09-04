@@ -6,19 +6,18 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 /**
  * Asynchronous half of the pipeline.
  *
- * <p>Day 1 scope is intentionally an empty shell: it builds, boots and answers
- * {@code /actuator/health}. That is enough to prove the multi-module build and
- * the container wiring end to end before there is any consumer logic to get
- * wrong.
+ * <p>Day 2 scope: it consumes {@code payout.requested} with manual
+ * acknowledgement, logs each event under the correlation id the API created it
+ * with, and answers {@code /actuator/health}. It settles nothing yet, and says
+ * so rather than pretending otherwise.
  *
  * <p>What lands here next:
  * <ul>
- *   <li>day 2: a {@code @KafkaListener} on {@code payout.requested}, keyed by
- *       payout id, with manual acknowledgement</li>
  *   <li>day 3: the atomic claim, the transient versus permanent error taxonomy,
- *       exponential backoff and the dead letter topic</li>
- *   <li>day 4: metrics, and the correlation id read back out of the Kafka
- *       headers into the MDC</li>
+ *       exponential backoff and the {@code payout.requested.dlt} dead letter
+ *       topic the contracts module already names</li>
+ *   <li>day 4: metrics, and structured logs carrying the correlation id this
+ *       listener already puts in the MDC</li>
  * </ul>
  */
 @SpringBootApplication

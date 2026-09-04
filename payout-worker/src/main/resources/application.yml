@@ -5,6 +5,42 @@ spring:
     virtual:
       enabled: true
 
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      # No group-id here on purpose: it lives on @KafkaListener, next to the
+      # listener it scales, so there is one place to read it.
+      #
+      # earliest, not latest. A worker that starts after the API has already
+      # accepted payouts must pick them up, not skip to whatever arrives next.
+      auto-offset-reset: earliest
+      # The offset is committed by the listener, not by a background timer. See
+      # ack-mode below.
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # ErrorHandlingDeserializer wraps the real one and turns a failure into a
+      # null value plus an exception header, instead of an exception thrown
+      # inside the consumer poll loop. Without it a single malformed record
+      # kills the container and the worker stops consuming everything else: one
+      # bad message becomes an outage.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        # Only the contracts package is trusted, and only one type is expected.
+        # Deserialising into whatever class a producer names in a header is a
+        # remote code execution shaped hole; this closes it by not looking at
+        # the header at all.
+        spring.json.trusted.packages: io.github.orlandol23.payout.contracts
+        spring.json.value.default.type: io.github.orlandol23.payout.contracts.PayoutRequested
+        spring.json.use.type.headers: false
+    listener:
+      # The listener acknowledges each record itself, and the commit goes to the
+      # broker straight away rather than at the end of the poll batch. The
+      # committed offset therefore means "the listener finished with this
+      # record", which is the only interpretation that stays true once day 3
+      # settles money in there.
+      ack-mode: manual_immediate
+
 server:
   # A different port from payout-api so both run side by side on one machine.
   # The worker serves no business traffic; this port exists for health probes
