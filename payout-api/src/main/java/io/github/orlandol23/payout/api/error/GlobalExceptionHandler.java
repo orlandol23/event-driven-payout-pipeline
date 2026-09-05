@@ -1,6 +1,7 @@
 package io.github.orlandol23.payout.api.error;
 
 import io.github.orlandol23.payout.api.correlation.CorrelationIdProvider;
+import io.github.orlandol23.payout.api.payout.IdempotencyKeyReusedException;
 import io.github.orlandol23.payout.api.payout.PayoutNotFoundException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
@@ -71,6 +72,33 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
                 ProblemTypes.PAYOUT_NOT_FOUND,
                 "Payout not found",
                 exception.getMessage(),
+                request.getRequestURI());
+    }
+
+    /**
+     * The caller reused an {@code Idempotency-Key} for a different request.
+     *
+     * <p>422 rather than 409. The request is syntactically fine and the server
+     * understood it perfectly; it refuses to act on it because the key already
+     * stands for something else. 409 would invite a retry, and this is the one
+     * failure a retry can never fix: the same key with the same new body fails
+     * identically forever. Changing the key, or the body, is the only way out.
+     *
+     * <p>Neither the key nor the winning payout id is echoed back. The caller
+     * already knows the key it sent, and the payout it names belongs to the
+     * earlier request; handing its id to whoever sent the second one turns a
+     * guessed key into a way to discover payout ids. Both are logged instead.
+     */
+    @ExceptionHandler(IdempotencyKeyReusedException.class)
+    public ProblemDetail handleIdempotencyKeyReused(IdempotencyKeyReusedException exception,
+                                                    HttpServletRequest request) {
+        log.warn("Idempotency key {} reused with a different request; it already created payout {}",
+                exception.getIdempotencyKey(), exception.getExistingPayoutId());
+        return problem(HttpStatus.UNPROCESSABLE_ENTITY,
+                ProblemTypes.IDEMPOTENCY_MISMATCH,
+                "Idempotency key reused",
+                "This Idempotency-Key was already used for a different request. "
+                        + "A key may only be replayed with the same amount and currency.",
                 request.getRequestURI());
     }
 

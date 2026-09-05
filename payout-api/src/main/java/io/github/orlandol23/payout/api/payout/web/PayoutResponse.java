@@ -18,6 +18,11 @@ import java.util.UUID;
  *
  * <p>{@code attempts} and {@code lastError} are exposed from day 1 even though
  * only the worker writes them, so the contract does not change when it does.
+ * {@code nextAttemptAt} joins them for the same reason: a caller polling a
+ * payout that is being retried should be able to see when the next attempt is
+ * due rather than guessing at the backoff schedule. {@code lockedAt} stays
+ * private, because which worker holds a row for how long is an implementation
+ * detail of the queue, not something a client should build on.
  */
 public record PayoutResponse(
         UUID id,
@@ -27,6 +32,7 @@ public record PayoutResponse(
         String correlationId,
         int attempts,
         String lastError,
+        Instant nextAttemptAt,
         Instant createdAt,
         Instant updatedAt) {
 
@@ -39,6 +45,7 @@ public record PayoutResponse(
                 payout.getCorrelationId(),
                 payout.getAttempts(),
                 payout.getLastError(),
+                payout.getNextAttemptAt(),
                 payout.getCreatedAt(),
                 payout.getUpdatedAt());
     }

@@ -47,6 +47,18 @@ public class Payout {
     @Column(name = "idempotency_key", length = IDEMPOTENCY_KEY_MAX_LENGTH, updatable = false)
     private String idempotencyKey;
 
+    /**
+     * Hash of the request this row was created from, so a replayed idempotency
+     * key can be told apart from a reused one.
+     *
+     * <p>Written once, never updated: the fingerprint describes the request that
+     * created the payout, and a payout whose request changed is a different
+     * payout. Null only on rows created before V2, which is why the service
+     * treats null as "unknown" and lets the replay through.
+     */
+    @Column(name = "idempotency_fingerprint", length = IdempotencyFingerprint.LENGTH, updatable = false)
+    private String idempotencyFingerprint;
+
     @Column(name = "amount", nullable = false, precision = 19, scale = AMOUNT_SCALE)
     private BigDecimal amount;
 
@@ -69,6 +81,25 @@ public class Payout {
     /** Last failure reason, truncated to fit. Null until something fails. */
     @Column(name = "last_error", length = 2048)
     private String lastError;
+
+    /**
+     * When a retried payout becomes claimable again. Null means "now".
+     *
+     * <p>Mapped read only, and that is the whole point of the annotations. The
+     * worker owns this column and writes it through its claim statement, never
+     * through this entity; mapping it here only lets {@code GET /payouts/{id}}
+     * tell a caller when the next attempt is due. {@code insertable = false}
+     * keeps the API from writing a value it has no business deciding, and
+     * {@code updatable = false} keeps a stale entity from overwriting one the
+     * worker just set.
+     *
+     * <p>{@code locked_at} is deliberately <em>not</em> mapped. Hibernate's
+     * {@code validate} asserts that every mapped column exists, not that every
+     * column is mapped, so a column only the worker cares about can simply not
+     * be here.
+     */
+    @Column(name = "next_attempt_at", insertable = false, updatable = false)
+    private Instant nextAttemptAt;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
@@ -96,6 +127,10 @@ public class Payout {
         this.lastError = null;
         this.createdAt = now;
         this.updatedAt = now;
+        // Derived here rather than passed in, so there is one definition of what
+        // "the same request" means and no caller can hand us a fingerprint that
+        // does not match the row it is stored on.
+        this.idempotencyFingerprint = IdempotencyFingerprint.of(amount, currency);
     }
 
     /**
@@ -137,6 +172,11 @@ public class Payout {
         return idempotencyKey;
     }
 
+    /** Null on rows created before V2: unknown, not "no fingerprint matches". */
+    public String getIdempotencyFingerprint() {
+        return idempotencyFingerprint;
+    }
+
     public BigDecimal getAmount() {
         return amount;
     }
@@ -159,6 +199,11 @@ public class Payout {
 
     public String getLastError() {
         return lastError;
+    }
+
+    /** When the worker will try again. Null while the payout is claimable now. */
+    public Instant getNextAttemptAt() {
+        return nextAttemptAt;
     }
 
     public Instant getCreatedAt() {

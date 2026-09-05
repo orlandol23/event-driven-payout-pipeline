@@ -1,7 +1,16 @@
 package io.github.orlandol23.payout.api;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.github.orlandol23.payout.api.correlation.CorrelationId;
 import io.github.orlandol23.payout.api.payout.web.PayoutController;
+import io.github.orlandol23.payout.contracts.PayoutRequested;
+import io.github.orlandol23.payout.contracts.PayoutTopics;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -18,14 +27,23 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.support.serializer.JsonDeserializer;
+import org.springframework.kafka.test.EmbeddedKafkaBroker;
+import org.springframework.kafka.test.context.EmbeddedKafka;
+import org.springframework.kafka.test.utils.KafkaTestUtils;
 import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -38,18 +56,24 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * End to end against a real PostgreSQL: HTTP in, migrated schema out.
+ * End to end against a real PostgreSQL and a real broker: HTTP in, migrated
+ * schema and a published event out.
  *
  * <p>Testcontainers rather than H2. The whole idempotency design rests on a
  * partial unique index and on PostgreSQL's behaviour when two transactions race
  * into it, and H2 does not reproduce either faithfully. A test that passes on a
  * different database than production is a test that lies.
  *
+ * <p>Kafka is embedded rather than containerised, because there is nothing about
+ * a broker in a container this needs that an in-JVM KRaft broker does not give.
+ * The database is the part that has to be the real thing.
+ *
  * <p>Named {@code *IT} so Failsafe runs it in the integration-test phase and
  * {@code mvn test} stays fast.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Testcontainers
+@EmbeddedKafka(partitions = 1, topics = PayoutTopics.PAYOUT_REQUESTED)
 @EnabledIf(value = "dockerIsAvailable", disabledReason = "Docker is required to start the PostgreSQL container")
 class PayoutApiIT {
 
@@ -76,13 +100,38 @@ class PayoutApiIT {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    @Autowired
+    private EmbeddedKafkaBroker broker;
+
+    private Consumer<String, PayoutRequested> consumer;
+
     /**
      * The container is shared, and these tests talk real HTTP, so there is no
      * transaction to roll back. Truncating is the isolation.
+     *
+     * <p>The topic is shared for the same reason, so the consumer is seeked to
+     * the end of it: each test sees only the events its own requests produced.
      */
     @BeforeEach
-    void clearPayouts() {
+    void clearPayoutsAndSubscribe() {
         jdbcTemplate.execute("TRUNCATE TABLE payouts");
+
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString());
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "payout-api-it-" + UUID.randomUUID());
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+
+        JsonDeserializer<PayoutRequested> valueDeserializer = new JsonDeserializer<>(PayoutRequested.class);
+        valueDeserializer.addTrustedPackages(PayoutRequested.class.getPackageName());
+
+        consumer = new DefaultKafkaConsumerFactory<>(props, new StringDeserializer(), valueDeserializer)
+                .createConsumer();
+        broker.consumeFromAnEmbeddedTopic(consumer, true, PayoutTopics.PAYOUT_REQUESTED);
+    }
+
+    @AfterEach
+    void unsubscribe() {
+        consumer.close();
     }
 
     // ------------------------------------------------------------------
@@ -97,7 +146,49 @@ class PayoutApiIT {
         List<String> applied = jdbcTemplate.queryForList(
                 "SELECT script FROM flyway_schema_history WHERE success ORDER BY installed_rank", String.class);
 
-        assertThat(applied).contains("V1__create_payouts_table.sql");
+        assertThat(applied).contains("V1__create_payouts_table.sql", "V2__payouts_claim_columns.sql");
+    }
+
+    @Test
+    @DisplayName("V2 added the columns the worker claims with, and Hibernate is happy not to map them all")
+    void claimColumnsExist() {
+        // next_attempt_at is mapped read only, locked_at is not mapped at all,
+        // and the context started anyway: ddl-auto=validate asserts that mapped
+        // columns exist, not that every column is mapped.
+        List<String> columns = jdbcTemplate.queryForList("""
+                SELECT column_name FROM information_schema.columns
+                 WHERE table_name = 'payouts'
+                """, String.class);
+
+        assertThat(columns).contains("next_attempt_at", "locked_at", "idempotency_fingerprint");
+    }
+
+    @Test
+    @DisplayName("the claim scan index orders by created_at, so 'oldest claimable first' is not a sort")
+    void claimScanIndexIsOrderedAndPartial() {
+        String definition = jdbcTemplate.queryForObject(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_payouts_claimable'", String.class);
+
+        assertThat(definition)
+                // created_at is the only key column, so the scan reads the index
+                // in order and stops at the batch limit instead of sorting two
+                // status groups. Status moved into the predicate, where it also
+                // keeps CONFIRMED and FAILED rows out of the index forever.
+                .contains("(created_at)")
+                .contains("WHERE")
+                .contains("PENDING")
+                .contains("PROCESSING");
+    }
+
+    @Test
+    @DisplayName("the database refuses a lock on a row that is not being processed")
+    void checkConstraintRejectsALockOutsideProcessing() {
+        assertThatThrownBy(() -> jdbcTemplate.update("""
+                INSERT INTO payouts (id, amount, currency, status, correlation_id, attempts,
+                                     locked_at, created_at, updated_at)
+                VALUES (?, 10.0000, 'USD', 'PENDING', 'corr', 0, now(), now(), now())
+                """, UUID.randomUUID()))
+                .isInstanceOf(DataIntegrityViolationException.class);
     }
 
     @Test
@@ -160,6 +251,10 @@ class PayoutApiIT {
         assertThat(read.getBody().get("currency").asText()).isEqualTo("BRL");
         assertThat(read.getBody().get("attempts").asInt()).isZero();
         assertThat(read.getBody().get("lastError").isNull()).isTrue();
+        // Exposed so a caller polling a retried payout can see when the next
+        // attempt is due rather than guessing at the backoff. Null here, because
+        // a payout nobody has tried yet is claimable now.
+        assertThat(read.getBody().get("nextAttemptAt").isNull()).isTrue();
     }
 
     @Test
@@ -221,6 +316,44 @@ class PayoutApiIT {
         // 200 rather than 201: the retry succeeded, but it did not create anything.
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(second.getBody().get("id").asText()).isEqualTo(first.getBody().get("id").asText());
+        assertThat(countPayouts()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("reusing a key with a different body is 422, not the first payout answered with a 200")
+    void reusingAKeyWithADifferentBodyIsRejected() {
+        String key = "order-" + UUID.randomUUID();
+
+        ResponseEntity<JsonNode> first = post("""
+                {"amount": 250.00, "currency": "BRL"}
+                """, key, null);
+        ResponseEntity<JsonNode> reused = post("""
+                {"amount": 999.99, "currency": "BRL"}
+                """, key, null);
+
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(reused.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(reused.getHeaders().getContentType()).isEqualTo(MediaType.APPLICATION_PROBLEM_JSON);
+        assertThat(reused.getBody().get("type").asText()).isEqualTo("urn:payout:error:idempotency-mismatch");
+        assertThat(reused.getBody().get("correlationId").asText()).isNotBlank();
+        // The first payout is untouched: no second row, and no second event.
+        assertThat(countPayouts()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("a key replayed with a differently scaled but identical amount is still a replay")
+    void amountScaleDoesNotBreakAReplay() {
+        String key = "order-" + UUID.randomUUID();
+
+        ResponseEntity<JsonNode> first = post("""
+                {"amount": 250.00, "currency": "BRL"}
+                """, key, null);
+        ResponseEntity<JsonNode> replay = post("""
+                {"amount": 250, "currency": "BRL"}
+                """, key, null);
+
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(replay.getBody().get("id").asText()).isEqualTo(first.getBody().get("id").asText());
         assertThat(countPayouts()).isEqualTo(1);
     }
 
@@ -301,6 +434,54 @@ class PayoutApiIT {
     }
 
     // ------------------------------------------------------------------
+    // Kafka: what the worker actually receives
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("a created payout is published on payout.requested, keyed by its id")
+    void createPublishesTheEvent() {
+        ResponseEntity<JsonNode> created = post("""
+                {"amount": 125.50, "currency": "BRL"}
+                """, null, "trace-abc-123");
+
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        String id = created.getBody().get("id").asText();
+
+        ConsumerRecord<String, PayoutRequested> record =
+                KafkaTestUtils.getSingleRecord(consumer, PayoutTopics.PAYOUT_REQUESTED, Duration.ofSeconds(20));
+
+        assertThat(record.key()).isEqualTo(id);
+        assertThat(record.value().payoutId()).hasToString(id);
+        assertThat(record.value().amount()).isEqualByComparingTo("125.5000");
+        assertThat(record.value().currency()).isEqualTo("BRL");
+        assertThat(record.value().correlationId()).isEqualTo("trace-abc-123");
+
+        Header correlationHeader = record.headers().lastHeader(CorrelationId.HEADER);
+        assertThat(correlationHeader).isNotNull();
+        assertThat(new String(correlationHeader.value(), StandardCharsets.UTF_8)).isEqualTo("trace-abc-123");
+    }
+
+    @Test
+    @DisplayName("a replayed request publishes nothing, so the worker is not handed the same payout twice")
+    void replayPublishesNothing() {
+        String key = "order-" + UUID.randomUUID();
+        String body = """
+                {"amount": 250.00, "currency": "BRL"}
+                """;
+
+        post(body, key, null);
+        // Drain the event the first request legitimately produced.
+        KafkaTestUtils.getSingleRecord(consumer, PayoutTopics.PAYOUT_REQUESTED, Duration.ofSeconds(20));
+
+        ResponseEntity<JsonNode> replay = post(body, key, null);
+
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(KafkaTestUtils.getRecords(consumer, Duration.ofSeconds(3)).isEmpty())
+                .as("nothing else reached the topic")
+                .isTrue();
+    }
+
+    // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
 
@@ -311,7 +492,7 @@ class PayoutApiIT {
             headers.set(PayoutController.IDEMPOTENCY_KEY_HEADER, idempotencyKey);
         }
         if (correlationId != null) {
-            headers.set(io.github.orlandol23.payout.api.correlation.CorrelationId.HEADER, correlationId);
+            headers.set(CorrelationId.HEADER, correlationId);
         }
         return restTemplate.exchange("/payouts", HttpMethod.POST, new HttpEntity<>(body, headers), JsonNode.class);
     }

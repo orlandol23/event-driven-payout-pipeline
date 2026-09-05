@@ -12,9 +12,12 @@ package io.github.orlandol23.payout.api.payout;
  *                          +--permanent failure, or retries exhausted--&gt; FAILED
  * </pre>
  *
- * <p>Only {@code PENDING} rows are claimable, which is what makes reprocessing
- * the same event a no-op instead of a double payment. The transitions out of
- * {@code PROCESSING} are implemented by the worker on day 3.
+ * <p>A payout is claimable while it is {@code PENDING} and due, or while it is
+ * {@code PROCESSING} under a lock the worker holding it has clearly abandoned.
+ * That is what makes reprocessing the same event a no-op instead of a double
+ * payment. The transitions are the worker's claim statements; this enum and the
+ * check constraint behind it are what stop anything else inventing a fifth
+ * state.
  */
 public enum PayoutStatus {
 

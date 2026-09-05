@@ -14,7 +14,7 @@ public class ClockConfig {
      * <p>{@code Instant.now()} inside a service is untestable: a test can only
      * assert "roughly now" and turns flaky on a slow machine. With a {@link Clock}
      * bean, tests substitute {@link Clock#fixed} and assert exact timestamps, and
-     * day 3's backoff logic becomes testable without sleeping.
+     * the worker's backoff schedule is assertable without sleeping.
      *
      * <p>UTC, not the system zone. Every timestamp is stored as
      * {@code timestamptz} and compared across services that may not share a

@@ -5,6 +5,111 @@ spring:
     virtual:
       enabled: true
 
+  datasource:
+    # The same database payout-api writes to, and the same local defaults, so a
+    # fresh clone runs with no setup. Sharing it is the design, not an accident:
+    # the queue is a table and the claim is a conditional UPDATE against it.
+    #
+    url: ${PAYOUT_DB_URL:jdbc:postgresql://localhost:5432/payout}
+    username: ${PAYOUT_DB_USERNAME:payout}
+    password: ${PAYOUT_DB_PASSWORD:payout}
+    hikari:
+      pool-name: payout-worker-pool
+      maximum-pool-size: ${PAYOUT_DB_POOL_SIZE:10}
+
+  flyway:
+    # Off, and said out loud rather than left to the absence of a dependency.
+    # The API owns the schema and migrates it on start; two services running the
+    # same migrations is a race at deploy time for no benefit. A worker that
+    # starts against a database the API has not migrated yet fails its
+    # statements and the rows stay claimable until it has.
+    #
+    # Flyway is on this module's classpath at test scope only, so the
+    # integration test can apply the API's migrations to its own container.
+    # Without this line, auto-configuration would take that as permission to
+    # migrate on every start.
+    enabled: false
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    # The worker produces exactly one kind of record: a dead letter. Same
+    # settings as the API's producer, for the same reasons, and deliberately not
+    # a second opinion on durability in the service that decides a payout is
+    # beyond saving.
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.block.ms: 5000
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+        # No __TypeId__ header: a consumer of the dead letter topic is told what
+        # to expect by its own configuration, not by our package layout.
+        spring.json.add.type.headers: false
+    consumer:
+      # No group-id here on purpose: it lives on @KafkaListener, next to the
+      # listener it scales, so there is one place to read it.
+      #
+      # earliest, not latest. A worker that starts after the API has already
+      # accepted payouts must pick them up, not skip to whatever arrives next.
+      auto-offset-reset: earliest
+      # The offset is committed by the listener, not by a background timer. See
+      # ack-mode below.
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # ErrorHandlingDeserializer wraps the real one and turns a failure into a
+      # null value plus an exception header, instead of an exception thrown
+      # inside the consumer poll loop. Without it a single malformed record
+      # kills the container and the worker stops consuming everything else: one
+      # bad message becomes an outage.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        # Only the contracts package is trusted, and only one type is expected.
+        # Deserialising into whatever class a producer names in a header is a
+        # remote code execution shaped hole; this closes it by not looking at
+        # the header at all.
+        spring.json.trusted.packages: io.github.orlandol23.payout.contracts
+        spring.json.value.default.type: io.github.orlandol23.payout.contracts.PayoutRequested
+        spring.json.use.type.headers: false
+    listener:
+      # The listener acknowledges each record itself, and the commit goes to the
+      # broker straight away rather than at the end of the poll batch. The
+      # committed offset therefore means "the listener finished with this
+      # record", which is the only interpretation that stays true now that the
+      # listener settles payouts rather than logging them.
+      ack-mode: manual_immediate
+
+payout:
+  worker:
+    # How many settlement attempts a payout gets before it is failed and dead
+    # lettered. Counted at claim time, so a worker that dies mid-settlement
+    # spends one: the conservative direction when the alternative is retrying a
+    # payment that may already have gone through.
+    max-attempts: ${PAYOUT_WORKER_MAX_ATTEMPTS:5}
+    # How long a PROCESSING row may hold its lock before another worker may take
+    # it. Comfortably longer than a settlement call: too short and two workers
+    # settle the same payout, too long and a crashed worker's payouts wait.
+    stale-lock: ${PAYOUT_WORKER_STALE_LOCK:5m}
+    # The claim scan: how often the worker looks at the table itself, how many
+    # rows it takes at a time, and whether it looks at all. This is what finds
+    # due retries, stale locks, and payouts whose payout.requested event was
+    # never published, which is why Kafka is a latency optimisation here rather
+    # than the source of truth.
+    poll-interval: ${PAYOUT_WORKER_POLL_INTERVAL:15s}
+    poll-batch-size: ${PAYOUT_WORKER_POLL_BATCH_SIZE:50}
+    poll-enabled: ${PAYOUT_WORKER_POLL_ENABLED:true}
+    settlement:
+      # No money moves. The amounts below select the outcome deterministically,
+      # so every branch of the retry policy is reachable from a curl command.
+      # See the failure mode table in the README.
+      latency: ${PAYOUT_WORKER_SETTLEMENT_LATENCY:200ms}
+      transient-cents: ${PAYOUT_WORKER_SETTLEMENT_TRANSIENT_CENTS:13}
+      permanent-cents: ${PAYOUT_WORKER_SETTLEMENT_PERMANENT_CENTS:66}
+      rejected-currency: ${PAYOUT_WORKER_SETTLEMENT_REJECTED_CURRENCY:XTS}
+
 server:
   # A different port from payout-api so both run side by side on one machine.
   # The worker serves no business traffic; this port exists for health probes

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.orlandol23</groupId>
+        <artifactId>payout-platform</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>payout-contracts</artifactId>
+    <name>payout-contracts</name>
+    <description>The wire contract shared by the producer and the consumer: event records and topic names</description>
+
+    <!--
+      Deliberately dependency free at compile scope, and deliberately not a
+      Spring Boot application: no starter, no spring-boot-maven-plugin, no
+      repackage. This is a plain jar that both services put on their classpath.
+
+      Records serialise and deserialise through their canonical constructor,
+      which Jackson supports natively, so nothing here needs a Jackson
+      annotation or a Jackson dependency. Adding one would be the first step
+      towards this module growing the business logic the README promises it
+      will never hold.
+    -->
+    <dependencies>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
