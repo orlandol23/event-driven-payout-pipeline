@@ -51,6 +51,7 @@ public class JdbcPayoutClaimRepository implements PayoutClaimRepository {
                SET status     = 'PROCESSING',
                    attempts   = attempts + 1,
                    locked_at  = :now,
+                   lock_token = :lockToken,
                    updated_at = :now
              WHERE id = :id
                AND (
@@ -58,7 +59,7 @@ public class JdbcPayoutClaimRepository implements PayoutClaimRepository {
                          AND (next_attempt_at IS NULL OR next_attempt_at <= :now))
                      OR (status = 'PROCESSING' AND locked_at < :staleBefore)
                    )
-            RETURNING id, amount, currency, correlation_id, attempts, created_at
+            RETURNING id, lock_token, amount, currency, correlation_id, attempts, created_at
             """;
 
     /**
@@ -93,6 +94,7 @@ public class JdbcPayoutClaimRepository implements PayoutClaimRepository {
                SET status     = 'PROCESSING',
                    attempts   = attempts + 1,
                    locked_at  = :now,
+                   lock_token = gen_random_uuid(),
                    updated_at = :now
               FROM due
              WHERE payouts.id = due.id
@@ -101,35 +103,59 @@ public class JdbcPayoutClaimRepository implements PayoutClaimRepository {
                          AND (payouts.next_attempt_at IS NULL OR payouts.next_attempt_at <= :now))
                      OR (payouts.status = 'PROCESSING' AND payouts.locked_at < :staleBefore)
                    )
-            RETURNING payouts.id, payouts.amount, payouts.currency,
+            RETURNING payouts.id, payouts.lock_token, payouts.amount, payouts.currency,
                       payouts.correlation_id, payouts.attempts, payouts.created_at
+            """;
+
+    /**
+     * Renews the lock without touching anything else.
+     *
+     * <p>Fenced on the token, so a worker whose lock was already reclaimed
+     * renews nothing and is told so before it calls the provider. Deliberately
+     * does not move {@code updated_at}: a heartbeat is not a change to the
+     * payout, and letting it look like one would hide the last real transition
+     * from anyone reading the table.
+     */
+    private static final String RENEW_LOCK = """
+            UPDATE payouts
+               SET locked_at = :now
+             WHERE id = :id
+               AND lock_token = :lockToken
+               AND status = 'PROCESSING'
             """;
 
     private static final String CONFIRM = """
             UPDATE payouts
                SET status         = 'CONFIRMED',
                    locked_at      = NULL,
+                   lock_token     = NULL,
                    next_attempt_at = NULL,
                    updated_at     = :now
              WHERE id = :id
+               AND lock_token = :lockToken
                AND status = 'PROCESSING'
             """;
 
     /**
      * Back to the queue, due at {@code nextAttemptAt}, with the reason recorded.
      *
-     * <p>Guarded by {@code status = 'PROCESSING'} like the other transitions, so
-     * a worker whose lock was already reclaimed cannot reach across and reset a
-     * payout another worker is holding.
+     * <p>Guarded by the lock token, not just by {@code status = 'PROCESSING'}.
+     * The status alone does not identify a holder: a row whose stale lock
+     * another worker has just reclaimed is still {@code PROCESSING}, so the
+     * status guard passes for the worker that no longer owns it and this
+     * statement would push a payout the new holder is actively settling back to
+     * PENDING underneath it.
      */
     private static final String SCHEDULE_RETRY = """
             UPDATE payouts
                SET status          = 'PENDING',
                    locked_at       = NULL,
+                   lock_token      = NULL,
                    next_attempt_at = :nextAttemptAt,
                    last_error      = :lastError,
                    updated_at      = :now
              WHERE id = :id
+               AND lock_token = :lockToken
                AND status = 'PROCESSING'
             """;
 
@@ -137,10 +163,12 @@ public class JdbcPayoutClaimRepository implements PayoutClaimRepository {
             UPDATE payouts
                SET status          = 'FAILED',
                    locked_at       = NULL,
+                   lock_token      = NULL,
                    next_attempt_at = NULL,
                    last_error      = :lastError,
                    updated_at      = :now
              WHERE id = :id
+               AND lock_token = :lockToken
                AND status = 'PROCESSING'
             """;
 
@@ -153,6 +181,7 @@ public class JdbcPayoutClaimRepository implements PayoutClaimRepository {
      */
     private static final RowMapper<ClaimedPayout> CLAIMED = (rs, rowNumber) -> new ClaimedPayout(
             rs.getObject("id", UUID.class),
+            rs.getObject("lock_token", UUID.class),
             rs.getBigDecimal("amount"),
             rs.getString("currency"),
             rs.getString("correlation_id"),
@@ -171,6 +200,7 @@ public class JdbcPayoutClaimRepository implements PayoutClaimRepository {
     public Optional<ClaimedPayout> claim(UUID payoutId, Instant now) {
         return jdbcClient.sql(CLAIM)
                 .param("id", payoutId)
+                .param("lockToken", UUID.randomUUID())
                 .param("now", at(now))
                 .param("staleBefore", at(now.minus(properties.staleLock())))
                 .query(CLAIMED)
@@ -195,30 +225,42 @@ public class JdbcPayoutClaimRepository implements PayoutClaimRepository {
     }
 
     @Override
-    public void confirm(UUID payoutId, Instant now) {
-        jdbcClient.sql(CONFIRM)
+    public boolean renewLock(UUID payoutId, UUID lockToken, Instant now) {
+        return jdbcClient.sql(RENEW_LOCK)
                 .param("id", payoutId)
+                .param("lockToken", lockToken)
                 .param("now", at(now))
-                .update();
+                .update() == 1;
     }
 
     @Override
-    public void scheduleRetry(UUID payoutId, Instant nextAttemptAt, String lastError, Instant now) {
-        jdbcClient.sql(SCHEDULE_RETRY)
+    public boolean confirm(UUID payoutId, UUID lockToken, Instant now) {
+        return jdbcClient.sql(CONFIRM)
                 .param("id", payoutId)
+                .param("lockToken", lockToken)
+                .param("now", at(now))
+                .update() == 1;
+    }
+
+    @Override
+    public boolean scheduleRetry(UUID payoutId, UUID lockToken, Instant nextAttemptAt, String lastError, Instant now) {
+        return jdbcClient.sql(SCHEDULE_RETRY)
+                .param("id", payoutId)
+                .param("lockToken", lockToken)
                 .param("nextAttemptAt", at(nextAttemptAt))
                 .param("lastError", PayoutClaimRepository.truncateLastError(lastError))
                 .param("now", at(now))
-                .update();
+                .update() == 1;
     }
 
     @Override
-    public void fail(UUID payoutId, String lastError, Instant now) {
-        jdbcClient.sql(FAIL)
+    public boolean fail(UUID payoutId, UUID lockToken, String lastError, Instant now) {
+        return jdbcClient.sql(FAIL)
                 .param("id", payoutId)
+                .param("lockToken", lockToken)
                 .param("lastError", PayoutClaimRepository.truncateLastError(lastError))
                 .param("now", at(now))
-                .update();
+                .update() == 1;
     }
 
     /**

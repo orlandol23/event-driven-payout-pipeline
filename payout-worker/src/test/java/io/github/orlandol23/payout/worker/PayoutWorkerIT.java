@@ -196,8 +196,8 @@ class PayoutWorkerIT {
     @DisplayName("a redelivered event claims nothing, because the payout is already settled")
     void redeliveryIsANoOp() {
         UUID payoutId = pendingPayout(new BigDecimal("10.0000"), "USD", NOW.minusSeconds(60));
-        repository.claim(payoutId, NOW);
-        repository.confirm(payoutId, NOW);
+        UUID token = claimToken(payoutId, NOW);
+        repository.confirm(payoutId, token, NOW);
 
         Optional<ClaimedPayout> redelivered = repository.claim(payoutId, NOW.plusSeconds(1));
 
@@ -211,8 +211,8 @@ class PayoutWorkerIT {
     @DisplayName("a payout whose retry is not due yet is not claimable")
     void aRetryThatIsNotDueIsNotClaimed() {
         UUID payoutId = pendingPayout(new BigDecimal("10.0000"), "USD", NOW.minusSeconds(60));
-        repository.claim(payoutId, NOW);
-        repository.scheduleRetry(payoutId, NOW.plus(Duration.ofMinutes(5)), "provider is down", NOW);
+        UUID token = claimToken(payoutId, NOW);
+        repository.scheduleRetry(payoutId, token, NOW.plus(Duration.ofMinutes(5)), "provider is down", NOW);
 
         assertThat(repository.claim(payoutId, NOW.plus(Duration.ofMinutes(1)))).isEmpty();
         assertThat(repository.claim(payoutId, NOW.plus(Duration.ofMinutes(5)))).isPresent();
@@ -236,6 +236,20 @@ class PayoutWorkerIT {
                 .isEqualTo(2);
     }
 
+    /**
+     * Claims a row and hands back the token that claim minted.
+     *
+     * <p>Every transition is fenced on the token, so a test that wants to make
+     * one has to hold the lock the same way the worker does. Fails loudly rather
+     * than returning null when the claim did not happen: a test that silently
+     * transitioned nothing would pass for the wrong reason.
+     */
+    private UUID claimToken(UUID payoutId, Instant now) {
+        return repository.claim(payoutId, now)
+                .orElseThrow(() -> new AssertionError("expected to claim payout " + payoutId))
+                .lockToken();
+    }
+
     // ------------------------------------------------------------------
     // Transitions
     // ------------------------------------------------------------------
@@ -244,9 +258,9 @@ class PayoutWorkerIT {
     @DisplayName("scheduling a retry returns the payout to the queue with its lock released")
     void scheduleRetryReleasesTheLock() {
         UUID payoutId = pendingPayout(new BigDecimal("10.0000"), "USD", NOW.minusSeconds(60));
-        repository.claim(payoutId, NOW);
+        UUID token = claimToken(payoutId, NOW);
 
-        repository.scheduleRetry(payoutId, NOW.plus(Duration.ofMinutes(1)), "SettlementUnavailableException", NOW);
+        repository.scheduleRetry(payoutId, token, NOW.plus(Duration.ofMinutes(1)), "SettlementUnavailableException", NOW);
 
         assertThat(statusOf(payoutId)).isEqualTo("PENDING");
         assertThat(instantColumn(payoutId, "locked_at"))
@@ -260,9 +274,9 @@ class PayoutWorkerIT {
     @DisplayName("last_error is truncated to the column rather than failing the write")
     void lastErrorIsTruncated() {
         UUID payoutId = pendingPayout(new BigDecimal("10.0000"), "USD", NOW.minusSeconds(60));
-        repository.claim(payoutId, NOW);
+        UUID token = claimToken(payoutId, NOW);
 
-        repository.fail(payoutId, "e".repeat(PayoutClaimRepository.LAST_ERROR_MAX_LENGTH + 500), NOW);
+        repository.fail(payoutId, token, "e".repeat(PayoutClaimRepository.LAST_ERROR_MAX_LENGTH + 500), NOW);
 
         assertThat(lastErrorOf(payoutId)).hasSize(PayoutClaimRepository.LAST_ERROR_MAX_LENGTH);
         assertThat(statusOf(payoutId)).isEqualTo("FAILED");
@@ -272,8 +286,8 @@ class PayoutWorkerIT {
     @DisplayName("a failed payout is terminal and never claimable again")
     void failIsTerminal() {
         UUID payoutId = pendingPayout(new BigDecimal("10.0000"), "USD", NOW.minusSeconds(60));
-        repository.claim(payoutId, NOW);
-        repository.fail(payoutId, "SettlementRejectedException: account closed", NOW);
+        UUID token = claimToken(payoutId, NOW);
+        repository.fail(payoutId, token, "SettlementRejectedException: account closed", NOW);
 
         assertThat(statusOf(payoutId)).isEqualTo("FAILED");
         assertThat(instantColumn(payoutId, "locked_at")).isNull();
@@ -281,13 +295,79 @@ class PayoutWorkerIT {
     }
 
     @Test
+    @DisplayName("a superseded worker cannot write to the row that was taken from it")
+    void aSupersededWorkerCannotWrite() {
+        UUID payoutId = pendingPayout(new BigDecimal("10.0000"), "USD", NOW.minusSeconds(60));
+
+        // Worker A takes the row and starts a settlement that runs long.
+        UUID tokenA = claimToken(payoutId, NOW);
+
+        // The call outlives the stale-lock window, so worker B reclaims it.
+        UUID tokenB = claimToken(payoutId, NOW.plus(STALE_LOCK.plusSeconds(1)));
+        assertThat(tokenB).as("every claim mints a fresh token").isNotEqualTo(tokenA);
+
+        // A now comes back. The row is still PROCESSING, so a guard on status
+        // alone would let all three of these through: this is the exact write
+        // that used to hand B's in-flight payout back to the queue.
+        Instant late = NOW.plus(STALE_LOCK.plusSeconds(2));
+        assertThat(repository.scheduleRetry(payoutId, tokenA, late.plusSeconds(60), "provider is down", late))
+                .as("A cannot return B's payout to the queue")
+                .isFalse();
+        assertThat(repository.confirm(payoutId, tokenA, late))
+                .as("A cannot confirm a payout it no longer holds")
+                .isFalse();
+        assertThat(repository.fail(payoutId, tokenA, "gave up", late))
+                .as("A cannot fail a payout it no longer holds")
+                .isFalse();
+        assertThat(repository.renewLock(payoutId, tokenA, late))
+                .as("A is told it lost the lock, before it spends anything")
+                .isFalse();
+
+        // B is untouched and still holding.
+        assertThat(statusOf(payoutId)).isEqualTo("PROCESSING");
+        assertThat(instantColumn(payoutId, "locked_at"))
+                .as("B's lock is exactly where B left it")
+                .isEqualTo(NOW.plus(STALE_LOCK.plusSeconds(1)));
+        assertThat(lastErrorOf(payoutId)).as("none of A's reasons landed").isNull();
+
+        // And B can still finish, which is the other half: the fence rejects the
+        // superseded worker without also locking out the real holder.
+        assertThat(repository.confirm(payoutId, tokenB, late)).isTrue();
+        assertThat(statusOf(payoutId)).isEqualTo("CONFIRMED");
+    }
+
+    @Test
+    @DisplayName("renewing the lock keeps a long settlement from going stale under its own holder")
+    void renewingTheLockHoldsOffTheReclaim() {
+        UUID payoutId = pendingPayout(new BigDecimal("10.0000"), "USD", NOW.minusSeconds(60));
+        UUID token = claimToken(payoutId, NOW);
+
+        // The claim scan stamps a whole batch at one instant and settles the
+        // rows one at a time, so the tail is reached long after the claim. A
+        // renewal at the moment the row is actually worked on is what stops that
+        // tail being reclaimed out from under the worker holding it.
+        Instant almostStale = NOW.plus(STALE_LOCK.minusSeconds(1));
+        assertThat(repository.renewLock(payoutId, token, almostStale)).isTrue();
+
+        // Without the renewal this instant would be past the timeout.
+        assertThat(repository.claim(payoutId, NOW.plus(STALE_LOCK.plusSeconds(1))))
+                .as("the renewed lock is measured from the renewal, not from the claim")
+                .isEmpty();
+
+        // The renewal moved the lock and nothing else.
+        assertThat(statusOf(payoutId)).isEqualTo("PROCESSING");
+        assertThat(instantColumn(payoutId, "locked_at")).isEqualTo(almostStale);
+        assertThat(attemptsOf(payoutId)).as("a heartbeat is not an attempt").isEqualTo(1);
+    }
+
+    @Test
     @DisplayName("a transition only applies to a row this worker is still holding")
     void transitionsRequireTheLock() {
         UUID payoutId = pendingPayout(new BigDecimal("10.0000"), "USD", NOW.minusSeconds(60));
 
-        // Never claimed, so still PENDING. A confirm that ignored the status
-        // would settle a payout nobody ever tried to settle.
-        repository.confirm(payoutId, NOW);
+        // Never claimed, so still PENDING and holding no token. A confirm that
+        // ignored either would settle a payout nobody ever tried to settle.
+        assertThat(repository.confirm(payoutId, UUID.randomUUID(), NOW)).isFalse();
 
         assertThat(statusOf(payoutId)).isEqualTo("PENDING");
     }
@@ -353,12 +433,11 @@ class PayoutWorkerIT {
     @DisplayName("the scan ignores rows that are not due, terminal, or freshly locked")
     void claimDueIgnoresEverythingElse() {
         UUID confirmed = pendingPayout(new BigDecimal("1.0000"), "USD", NOW.minus(Duration.ofMinutes(40)));
-        repository.claim(confirmed, NOW);
-        repository.confirm(confirmed, NOW);
+        repository.confirm(confirmed, claimToken(confirmed, NOW), NOW);
 
         UUID notDue = pendingPayout(new BigDecimal("2.0000"), "USD", NOW.minus(Duration.ofMinutes(30)));
-        repository.claim(notDue, NOW);
-        repository.scheduleRetry(notDue, NOW.plus(Duration.ofMinutes(30)), "provider is down", NOW);
+        repository.scheduleRetry(notDue, claimToken(notDue, NOW),
+                NOW.plus(Duration.ofMinutes(30)), "provider is down", NOW);
 
         UUID freshlyLocked = pendingPayout(new BigDecimal("3.0000"), "USD", NOW.minus(Duration.ofMinutes(20)));
         repository.claim(freshlyLocked, NOW);

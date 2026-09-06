@@ -39,6 +39,7 @@ public class InMemoryPayoutClaimRepository implements PayoutClaimRepository {
         public String status = "PENDING";
         public int attempts;
         public Instant lockedAt;
+        public UUID lockToken;
         public Instant nextAttemptAt;
         public String lastError;
 
@@ -79,8 +80,10 @@ public class InMemoryPayoutClaimRepository implements PayoutClaimRepository {
         row.status = "PROCESSING";
         row.attempts++;
         row.lockedAt = now;
+        row.lockToken = UUID.randomUUID();
         return Optional.of(new ClaimedPayout(
-                payoutId, row.amount, row.currency, row.correlationId, row.attempts, row.createdAt));
+                payoutId, row.lockToken, row.amount, row.currency, row.correlationId,
+                row.attempts, row.createdAt));
     }
 
     /**
@@ -102,38 +105,58 @@ public class InMemoryPayoutClaimRepository implements PayoutClaimRepository {
     }
 
     @Override
-    public synchronized void confirm(UUID payoutId, Instant now) {
-        Row row = processing(payoutId);
+    public synchronized boolean renewLock(UUID payoutId, UUID lockToken, Instant now) {
+        Row row = held(payoutId, lockToken);
         if (row == null) {
-            return;
+            return false;
+        }
+        row.lockedAt = now;
+        return true;
+    }
+
+    @Override
+    public synchronized boolean confirm(UUID payoutId, UUID lockToken, Instant now) {
+        Row row = held(payoutId, lockToken);
+        if (row == null) {
+            return false;
         }
         row.status = "CONFIRMED";
         row.lockedAt = null;
+        row.lockToken = null;
         row.nextAttemptAt = null;
+        return true;
     }
 
     @Override
-    public synchronized void scheduleRetry(UUID payoutId, Instant nextAttemptAt, String lastError, Instant now) {
-        Row row = processing(payoutId);
+    public synchronized boolean scheduleRetry(UUID payoutId,
+                                              UUID lockToken,
+                                              Instant nextAttemptAt,
+                                              String lastError,
+                                              Instant now) {
+        Row row = held(payoutId, lockToken);
         if (row == null) {
-            return;
+            return false;
         }
         row.status = "PENDING";
         row.lockedAt = null;
+        row.lockToken = null;
         row.nextAttemptAt = nextAttemptAt;
         row.lastError = PayoutClaimRepository.truncateLastError(lastError);
+        return true;
     }
 
     @Override
-    public synchronized void fail(UUID payoutId, String lastError, Instant now) {
-        Row row = processing(payoutId);
+    public synchronized boolean fail(UUID payoutId, UUID lockToken, String lastError, Instant now) {
+        Row row = held(payoutId, lockToken);
         if (row == null) {
-            return;
+            return false;
         }
         row.status = "FAILED";
         row.lockedAt = null;
+        row.lockToken = null;
         row.nextAttemptAt = null;
         row.lastError = PayoutClaimRepository.truncateLastError(lastError);
+        return true;
     }
 
     /** The two arms of the claim predicate: due and unheld, or holding a stale lock. */
@@ -146,9 +169,17 @@ public class InMemoryPayoutClaimRepository implements PayoutClaimRepository {
                 && row.lockedAt.isBefore(now.minus(staleLock));
     }
 
-    /** Every transition out of a claim is guarded by the row still being held. */
-    private Row processing(UUID payoutId) {
+    /**
+     * Every transition out of a claim is guarded by <em>this</em> claim still
+     * holding the row, which is the token and not just the status. A row whose
+     * stale lock another worker reclaimed is still PROCESSING, so matching on
+     * status alone would let a superseded worker write over the holder.
+     */
+    private Row held(UUID payoutId, UUID lockToken) {
         Row row = rows.get(payoutId);
-        return row != null && "PROCESSING".equals(row.status) ? row : null;
+        if (row == null || !"PROCESSING".equals(row.status)) {
+            return null;
+        }
+        return lockToken != null && lockToken.equals(row.lockToken) ? row : null;
     }
 }

@@ -111,6 +111,7 @@ class PayoutPollerTest {
     private static ClaimedPayout claimed() {
         return new ClaimedPayout(
                 UUID.randomUUID(),
+                UUID.randomUUID(),
                 new BigDecimal("125.5000"),
                 "BRL",
                 "corr-abc-123",

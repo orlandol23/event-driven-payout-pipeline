@@ -45,16 +45,19 @@ and versioned separately.
 
 ```bash
 docker compose up -d                   # PostgreSQL 5432, Kafka 9092, kafka-ui 8090
-./mvnw -B test                         # 116 tests, no Docker needed
-./mvnw -B verify                       # the above plus 34 Testcontainers ITs
+./mvnw -B test                         # 121 tests, no Docker needed
+./mvnw -B verify                       # the above plus 36 Testcontainers ITs
 ./mvnw -pl payout-api spring-boot:run  # migrates the schema, then serves HTTP
 ```
 
-`test` covers unit, web slice and embedded Kafka. `verify` adds the
-Testcontainers integration tests against real PostgreSQL and Kafka; with no
-Docker daemon they are skipped by `@EnabledIf`. `Skipped: 34` in the failsafe
-output means the daemon is missing, not that the tests passed. CI runs on
-`ubuntu-latest`, which ships the daemon, so they run for real there.
+`test` covers unit, web slice and embedded Kafka. The Kafka tests use the
+in-process KRaft broker from `spring-kafka-test`, not Testcontainers, so they
+need no Docker. `verify` adds the Testcontainers integration tests, which are
+PostgreSQL only; with no Docker daemon they are skipped by `@EnabledIf` and the
+failsafe output reports them per module (`Skipped: 19` for the API,
+`Skipped: 17` for the worker), never as one number. Seeing those means the
+daemon is missing, not that the tests passed. CI runs on `ubuntu-latest`, which
+ships the daemon, so they run for real there.
 
 Keep the test counts in `README.md` in sync when tests are added.
 
@@ -64,6 +67,17 @@ Keep the test counts in `README.md` in sync when tests are added.
   `JdbcClient`, never through the API's JPA entity. Losing the race returns zero
   rows and the consumer exits clean, and that is precisely what makes a
   redelivered Kafka event a no-op. Do not collapse it into a read-then-write.
+- Every transition out of a claim is fenced by the `lock_token` that claim
+  minted, not by `status = 'PROCESSING'` alone. A row whose stale lock another
+  worker reclaimed is still `PROCESSING`, so a status-only guard lets a
+  superseded worker write over the current holder. The transitions return
+  whether they applied and the processor says so out loud when one did not;
+  neither the boolean nor the token is optional.
+- `SettlementGateway` requires the provider to deduplicate on the payout id.
+  That is where exactly-once actually lives: the worker can die between the
+  provider taking the money and the row recording it, and the row is then
+  reclaimed and settled again on purpose. Keep `SimulatedSettlementGateway`
+  honouring it, or the simulation demonstrates the opposite of the README.
 - Timestamps in that SQL come from the injected `Clock`, never from `now()`, so
   the retry backoff stays testable.
 - The table is the source of truth; Kafka is a latency optimisation. The poller
