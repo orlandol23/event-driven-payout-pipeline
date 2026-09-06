@@ -8,6 +8,9 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.time.Duration;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A settlement provider that moves no money and fails on demand.
@@ -37,6 +40,14 @@ import java.time.Duration;
  * <p>Deterministic rather than random on purpose. A gateway that fails one call
  * in ten makes a test that passes most of the time, which is worse than no test:
  * it is a test nobody trusts and everybody reruns.
+ *
+ * <p>It also honours the idempotency contract on {@link SettlementGateway}: a
+ * payout id it has already settled is not settled again. That is the half of
+ * the pipeline's exactly-once story that lives outside this codebase, and a
+ * simulation that quietly paid twice would demonstrate the opposite of what the
+ * README claims while every test still passed. The set is in memory and per
+ * process, which is the honest limit of a stand-in: a real provider remembers
+ * across restarts, and until there is one, so does the failure mode.
  */
 @Component
 public class SimulatedSettlementGateway implements SettlementGateway {
@@ -49,12 +60,35 @@ public class SimulatedSettlementGateway implements SettlementGateway {
 
     private final SettlementProperties properties;
 
+    /**
+     * Payout ids this process has already settled.
+     *
+     * <p>Concurrent because the Kafka listener and the claim scan settle on
+     * different threads, and the whole point of this set is the case where two
+     * of them reach the same payout.
+     */
+    private final Set<UUID> settled = ConcurrentHashMap.newKeySet();
+
     public SimulatedSettlementGateway(SettlementProperties properties) {
         this.properties = properties;
     }
 
+    /** How many distinct payouts this process has settled. For tests and the demo. */
+    public int settledCount() {
+        return settled.size();
+    }
+
     @Override
     public void settle(SettlementInstruction instruction) {
+        // Before the pause, not after: a duplicate should be cheap, and a
+        // provider that already holds the result does not go back to the network
+        // for it.
+        if (settled.contains(instruction.payoutId())) {
+            log.info("Payout {} was already settled by this provider; returning the first result (simulated idempotency)",
+                    instruction.payoutId());
+            return;
+        }
+
         pause(properties.latency());
 
         if (properties.rejectedCurrency().equalsIgnoreCase(instruction.currency())) {
@@ -72,6 +106,11 @@ public class SimulatedSettlementGateway implements SettlementGateway {
                     "Settlement was rejected by the provider (simulated for .%02d)".formatted(cents));
         }
 
+        // Recorded only on the success path. A rejected or unavailable attempt
+        // moved no money, so a retry of it has to reach the provider for real:
+        // remembering failures here would turn the transient failure mode into a
+        // payout that can never succeed.
+        settled.add(instruction.payoutId());
         log.info("Settled payout {} for {} {} (simulated)",
                 instruction.payoutId(), instruction.amount(), instruction.currency());
     }

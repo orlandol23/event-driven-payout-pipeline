@@ -110,6 +110,20 @@ public class PayoutProcessor {
             return;
         }
 
+        // Prove the lock is still ours immediately before spending money, not
+        // only when the batch was claimed. A claim scan stamps every row in a
+        // batch at the same instant and then settles them one at a time, so the
+        // tail of a large batch can go stale while this worker is still holding
+        // it. Renewing here measures the lock from the work rather than from the
+        // scan, and a renewal that updates nothing is this worker being told the
+        // row is no longer its own while that still costs nothing.
+        if (!repository.renewLock(claimed.id(), claimed.lockToken(), Instant.now(clock))) {
+            log.warn("Payout {} was reclaimed by another worker before this one could settle it; "
+                            + "abandoning it without calling the provider",
+                    claimed.id());
+            return;
+        }
+
         log.info("Settling payout {} for {} {}, attempt {} of {}",
                 claimed.id(), claimed.amount(), claimed.currency(),
                 claimed.attempts(), properties.maxAttempts());
@@ -122,7 +136,19 @@ public class PayoutProcessor {
             return;
         }
 
-        repository.confirm(claimed.id(), Instant.now(clock));
+        // A rejected confirm means the settlement above happened and the table
+        // has no record of it. There is nothing this worker can do about that on
+        // its own, so the one thing it must not do is stay quiet: the payout is
+        // claimable again and the next holder will call the provider a second
+        // time, which only the provider's own idempotency then stops.
+        if (!repository.confirm(claimed.id(), claimed.lockToken(), Instant.now(clock))) {
+            log.error("Payout {} settled but could not be confirmed: this worker's lock was reclaimed "
+                            + "while the provider was being called. The payout is claimable again and "
+                            + "will be re-sent under the same payout id, so it is the provider's "
+                            + "idempotency that decides whether money moves twice. Needs a human.",
+                    claimed.id());
+            return;
+        }
         log.info("Confirmed payout {} on attempt {}", claimed.id(), claimed.attempts());
     }
 
@@ -155,9 +181,27 @@ public class PayoutProcessor {
 
         Instant now = Instant.now(clock);
         Instant nextAttemptAt = backoffSchedule.nextAttemptAt(claimed.attempts(), now);
-        repository.scheduleRetry(claimed.id(), nextAttemptAt, reason, now);
+        if (!repository.scheduleRetry(claimed.id(), claimed.lockToken(), nextAttemptAt, reason, now)) {
+            logLostLock(claimed, "schedule a retry");
+            return;
+        }
         log.warn("Payout {} failed transiently on attempt {} of {}, next attempt at {}: {}",
                 claimed.id(), claimed.attempts(), properties.maxAttempts(), nextAttemptAt, reason, failure);
+    }
+
+    /**
+     * A transition this worker no longer had the right to make.
+     *
+     * <p>Always logged, never swallowed. Before the lock token existed these
+     * updates were fired and their row count discarded, so a worker overwriting
+     * a payout it had lost, or failing to record one it had settled, left no
+     * trace at all. The token turns both into a rejected update, and this is
+     * what makes the rejection visible instead of merely harmless.
+     */
+    private void logLostLock(ClaimedPayout claimed, String attemptedTransition) {
+        log.warn("Payout {} could not {}: this worker's lock was reclaimed while it was settling. "
+                        + "Another worker owns the payout now and its outcome is the one that counts.",
+                claimed.id(), attemptedTransition);
     }
 
     /**
@@ -170,7 +214,13 @@ public class PayoutProcessor {
      * that the scan would eventually reclaim and try to settle again.
      */
     private void giveUp(ClaimedPayout claimed, DeadLetterReason reason, String lastError) {
-        repository.fail(claimed.id(), lastError, Instant.now(clock));
+        if (!repository.fail(claimed.id(), claimed.lockToken(), lastError, Instant.now(clock))) {
+            // No dead letter either. The row is not FAILED, so it is not
+            // finished, and announcing a terminal failure for a payout another
+            // worker is still settling would put a lie on the dead letter topic.
+            logLostLock(claimed, "be failed");
+            return;
+        }
         deadLetterPublisher.publish(claimed.toEvent(), reason, lastError, claimed.attempts());
     }
 

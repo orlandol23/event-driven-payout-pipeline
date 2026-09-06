@@ -3,7 +3,11 @@
 ![CI](https://github.com/orlandol23/event-driven-payout-pipeline/actions/workflows/ci.yml/badge.svg)
 
 An asynchronous payout pipeline in Java 21 and Spring Boot 3: an HTTP edge that
-accepts payout requests, and a worker that settles them exactly once.
+accepts payout requests, and a worker that settles each of them once, and can
+say precisely where that guarantee comes from and where it stops. The short
+version: at-least-once delivery to the provider, exactly-once effect, given a
+provider that deduplicates on the payout id. The long version is
+[below](#what-exactly-once-actually-means-here).
 
 > **Status: day 3 of 5.** The API, the schema, the idempotency guarantee, the
 > Kafka hop and the worker that claims, settles, retries and dead letters are
@@ -136,6 +140,42 @@ suite: nobody trusts it and everybody reruns it.
   not the outcome. Same gap as the missing outbox, bounded the same way, and in
   [Known limitations](#known-limitations) rather than left to be discovered.
 
+## What "exactly once" actually means here
+
+Worth stating precisely, because the phrase is usually sold without its
+conditions and this pipeline exists to demonstrate the conditions.
+
+**What the pipeline guarantees on its own.** A payout is settled at most once
+per claim. Two workers handed the same event both run the conditional `UPDATE`;
+the database serialises them and the loser updates zero rows. Every state
+change afterwards is guarded by the `lock_token` that claim minted, so a worker
+whose lock was reclaimed while it was working updates nothing instead of writing
+over the worker that holds the row now. Immediately before the provider is
+called, the lock is renewed: a renewal that updates nothing is this worker being
+told the row is no longer its own while that still costs nothing.
+
+**What it cannot guarantee, and no amount of care upstream would.** The worker
+can die in the window between the provider accepting the money and the row
+recording that it did. The row is then `PROCESSING` with a lock nobody will
+release, the stale-lock timeout expires, another worker claims it, and the
+provider is called a second time. That is deliberate. The alternative is to drop
+payouts whose outcome is merely unknown, and for money, retrying an unknown is
+the safer direction.
+
+**So the second call has to be harmless, and that is the provider's job.**
+`SettlementInstruction` carries the payout id as the idempotency key, and
+`SettlementGateway` documents deduplicating on it as part of the contract rather
+than as a suggestion. `SimulatedSettlementGateway` honours it, so the simulation
+demonstrates the guarantee instead of quietly contradicting it.
+
+**Where it is still thin.** The simulated gateway remembers settled ids in
+process memory, so a restart forgets them. A real provider remembers across
+restarts; until there is one, that difference is a property of the stand-in and
+is named here rather than left to be discovered. There is also no timeout on the
+settlement call itself: a provider that hangs forever holds a worker thread and
+its lock is renewed only once, before the call, so the row does eventually
+become reclaimable. Bounding that call is day 4 work.
+
 ## Honest scope
 
 What works today, and is covered by tests:
@@ -152,6 +192,8 @@ What works today, and is covered by tests:
 | The worker consumes it with manual acknowledgement, and survives a poison payload | Implemented |
 | An `Idempotency-Key` reused with a different body is `422`, not the first payout | Implemented |
 | Atomic claim: one conditional `UPDATE`, so a redelivered event settles nothing twice | Implemented |
+| Fenced transitions: every state change is guarded by the lock token its claim minted | Implemented |
+| The lock is renewed immediately before settling, so a batch tail cannot go stale unnoticed | Implemented |
 | Settlement through a gateway with a transient versus permanent error taxonomy | Implemented, **simulated** |
 | Retry with a fixed backoff ladder and a bounded attempt budget | Implemented |
 | Dead letter topic `payout.requested.dlt`, with the failure diagnosed in headers | Implemented |
@@ -498,7 +540,12 @@ explains. The eight that matter most:
 
 6. **The Kafka key is the payout id, and the acknowledgement is manual.** The
    key is what puts every event about one payout on one partition, in order, in
-   front of one consumer, so two workers can never hold the same payout at once.
+   front of one consumer. It is not what stops two workers settling the same
+   payout, and it is worth being exact about that: the claim scan reaches rows
+   without going through Kafka at all, and the stale-lock arm of the claim
+   exists precisely to let a second worker take a row the first one is holding.
+   What keeps two workers off one payout is the conditional `UPDATE` and the
+   lock token it mints, not the partition.
    The manual acknowledgement is what makes the committed offset mean "the
    listener finished" rather than "a timer fired": with auto-commit, a worker
    that dies mid-settlement comes back to a payout Kafka believes was handled.
@@ -536,7 +583,7 @@ mvn test      # unit, web slice and embedded Kafka tests, no Docker needed
 mvn verify    # the above, plus Testcontainers integration tests
 ```
 
-116 unit, slice and embedded-Kafka tests run without Docker; 34 integration
+121 unit, slice and embedded-Kafka tests run without Docker; 36 integration
 tests need it. `mvn verify` starts real PostgreSQL 16 containers, one for the
 API's tests and one for the worker's. Without Docker the integration tests are
 skipped rather than failed, so `mvn test` is always runnable.

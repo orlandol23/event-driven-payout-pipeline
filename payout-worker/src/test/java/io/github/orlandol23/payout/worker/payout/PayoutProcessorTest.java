@@ -7,12 +7,14 @@ import io.github.orlandol23.payout.worker.settlement.SettlementGateway;
 import io.github.orlandol23.payout.worker.settlement.SettlementInstruction;
 import io.github.orlandol23.payout.worker.settlement.SettlementRejectedException;
 import io.github.orlandol23.payout.worker.settlement.SettlementUnavailableException;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Captor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -29,6 +31,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -54,6 +58,8 @@ class PayoutProcessorTest {
 
     private static final Instant REQUESTED_AT = Instant.parse("2026-07-27T10:00:00Z");
     private static final String CORRELATION_ID = "corr-abc-123";
+    /** The token this worker's claim minted. Every transition is fenced on it. */
+    private static final UUID LOCK_TOKEN = UUID.fromString("11111111-2222-4333-8444-555555555555");
     private static final int MAX_ATTEMPTS = 3;
 
     private static final UUID PAYOUT_ID = UUID.randomUUID();
@@ -74,6 +80,24 @@ class PayoutProcessorTest {
     private ArgumentCaptor<String> lastErrorCaptor;
 
     private PayoutProcessor processor;
+
+    /**
+     * The happy default: this worker still holds the lock and every transition
+     * lands.
+     *
+     * <p>Lenient because most tests never reach a transition, and stubbing what
+     * they do not use is not a reason to fail them. It is stubbed at all because
+     * an unstubbed boolean mock returns false, which here means "you lost the
+     * lock" and would quietly turn every settlement test into a test of the
+     * abandon path.
+     */
+    @BeforeEach
+    void holdsTheLock() {
+        lenient().when(repository.renewLock(any(), any(), any())).thenReturn(true);
+        lenient().when(repository.confirm(any(), any(), any())).thenReturn(true);
+        lenient().when(repository.scheduleRetry(any(), any(), any(), any(), any())).thenReturn(true);
+        lenient().when(repository.fail(any(), any(), any(), any())).thenReturn(true);
+    }
 
     private PayoutProcessor processor() {
         if (processor == null) {
@@ -104,9 +128,9 @@ class PayoutProcessorTest {
 
             assertThat(worked).isFalse();
             verifyNoInteractions(settlementGateway, deadLetterPublisher);
-            verify(repository, never()).confirm(any(), any());
-            verify(repository, never()).scheduleRetry(any(), any(), any(), any());
-            verify(repository, never()).fail(any(), any(), any());
+            verify(repository, never()).confirm(any(), any(), any());
+            verify(repository, never()).scheduleRetry(any(), any(), any(), any(), any());
+            verify(repository, never()).fail(any(), any(), any(), any());
         }
 
         @Test
@@ -129,7 +153,7 @@ class PayoutProcessorTest {
             assertThat(worked).isTrue();
             verify(settlementGateway).settle(new SettlementInstruction(
                     PAYOUT_ID, new BigDecimal("125.5000"), "BRL", CORRELATION_ID));
-            verify(repository).confirm(PAYOUT_ID, NOW);
+            verify(repository).confirm(PAYOUT_ID, LOCK_TOKEN, NOW);
             verifyNoInteractions(deadLetterPublisher);
         }
     }
@@ -147,9 +171,9 @@ class PayoutProcessorTest {
             processor().process(claimed(1));
 
             // First attempt failed, so one minute from the fixed clock.
-            verify(repository).scheduleRetry(eq(PAYOUT_ID), eq(Instant.parse("2026-07-27T10:16:30Z")),
+            verify(repository).scheduleRetry(eq(PAYOUT_ID), eq(LOCK_TOKEN), eq(Instant.parse("2026-07-27T10:16:30Z")),
                     any(), eq(NOW));
-            verify(repository, never()).fail(any(), any(), any());
+            verify(repository, never()).fail(any(), any(), any(), any());
             verifyNoInteractions(deadLetterPublisher);
         }
 
@@ -161,7 +185,7 @@ class PayoutProcessorTest {
 
             processor().process(claimed(2));
 
-            verify(repository).scheduleRetry(eq(PAYOUT_ID), eq(Instant.parse("2026-07-27T10:20:30Z")),
+            verify(repository).scheduleRetry(eq(PAYOUT_ID), eq(LOCK_TOKEN), eq(Instant.parse("2026-07-27T10:20:30Z")),
                     any(), eq(NOW));
         }
 
@@ -173,7 +197,7 @@ class PayoutProcessorTest {
 
             processor().process(claimed(1));
 
-            verify(repository).scheduleRetry(any(), any(), lastErrorCaptor.capture(), any());
+            verify(repository).scheduleRetry(any(), any(), any(), lastErrorCaptor.capture(), any());
             assertThat(lastErrorCaptor.getValue())
                     .isEqualTo("SettlementUnavailableException: provider is down");
         }
@@ -186,8 +210,8 @@ class PayoutProcessorTest {
 
             processor().process(claimed(MAX_ATTEMPTS));
 
-            verify(repository, never()).scheduleRetry(any(), any(), any(), any());
-            verify(repository).fail(eq(PAYOUT_ID), lastErrorCaptor.capture(), eq(NOW));
+            verify(repository, never()).scheduleRetry(any(), any(), any(), any(), any());
+            verify(repository).fail(eq(PAYOUT_ID), eq(LOCK_TOKEN), lastErrorCaptor.capture(), eq(NOW));
             assertThat(lastErrorCaptor.getValue()).contains("provider is still down");
             verify(deadLetterPublisher).publish(any(), eq(DeadLetterReason.EXHAUSTED), any(), eq(MAX_ATTEMPTS));
         }
@@ -203,8 +227,8 @@ class PayoutProcessorTest {
 
             processor().process(claimed(1));
 
-            verify(repository).scheduleRetry(eq(PAYOUT_ID), any(), any(), eq(NOW));
-            verify(repository, never()).fail(any(), any(), any());
+            verify(repository).scheduleRetry(eq(PAYOUT_ID), eq(LOCK_TOKEN), any(), any(), eq(NOW));
+            verify(repository, never()).fail(any(), any(), any(), any());
         }
     }
 
@@ -220,8 +244,8 @@ class PayoutProcessorTest {
 
             processor().process(claimed(1));
 
-            verify(repository, never()).scheduleRetry(any(), any(), any(), any());
-            verify(repository).fail(eq(PAYOUT_ID), lastErrorCaptor.capture(), eq(NOW));
+            verify(repository, never()).scheduleRetry(any(), any(), any(), any(), any());
+            verify(repository).fail(eq(PAYOUT_ID), eq(LOCK_TOKEN), lastErrorCaptor.capture(), eq(NOW));
             assertThat(lastErrorCaptor.getValue()).isEqualTo("SettlementRejectedException: account closed");
             verify(deadLetterPublisher).publish(any(), eq(DeadLetterReason.PERMANENT), any(), eq(1));
         }
@@ -257,14 +281,112 @@ class PayoutProcessorTest {
             processor().process(claimed(MAX_ATTEMPTS + 1));
 
             verifyNoInteractions(settlementGateway);
-            verify(repository).fail(eq(PAYOUT_ID), any(), eq(NOW));
+            verify(repository).fail(eq(PAYOUT_ID), eq(LOCK_TOKEN), any(), eq(NOW));
             verify(deadLetterPublisher).publish(any(), eq(DeadLetterReason.EXHAUSTED), any(),
                     eq(MAX_ATTEMPTS + 1));
         }
     }
 
+    /**
+     * The lock this worker holds can be taken from it while it works.
+     *
+     * <p>Before the lock token existed, none of this was observable: every
+     * transition guarded on {@code status = 'PROCESSING'}, which a row still is
+     * after another worker reclaimed it, so a superseded worker's write landed
+     * on the new holder's row and its own rejected update was discarded without
+     * a word. These pin both halves: the write is refused, and the refusal is
+     * said out loud.
+     */
+    @Nested
+    @DisplayName("a lock reclaimed mid-flight")
+    class LockReclaimedMidFlight {
+
+        @Test
+        @DisplayName("stops the settlement before the provider is called at all")
+        void doesNotSettleWithoutTheLock() {
+            // The renewal immediately before the call is the last cheap moment
+            // to find out. After it, money has moved and no amount of care in
+            // this process can undo that.
+            when(repository.renewLock(PAYOUT_ID, LOCK_TOKEN, NOW)).thenReturn(false);
+
+            processor().process(claimed(1));
+
+            verifyNoInteractions(settlementGateway, deadLetterPublisher);
+            verify(repository, never()).confirm(any(), any(), any());
+            verify(repository, never()).scheduleRetry(any(), any(), any(), any(), any());
+            verify(repository, never()).fail(any(), any(), any(), any());
+        }
+
+        @Test
+        @DisplayName("does not let a superseded worker push the holder's payout back to PENDING")
+        void doesNotRewriteTheHolderState() {
+            // The concrete corruption: A settles slowly, B reclaims the stale
+            // lock and starts settling, A comes back with a transient failure.
+            // Guarded on status alone, A's scheduleRetry would succeed and hand
+            // B's in-flight payout back to the queue.
+            when(repository.scheduleRetry(eq(PAYOUT_ID), eq(LOCK_TOKEN), any(), any(), any()))
+                    .thenReturn(false);
+            doThrow(new SettlementUnavailableException("provider is down"))
+                    .when(settlementGateway).settle(any());
+
+            processor().process(claimed(1));
+
+            // The attempt was made and refused. What matters is that nothing
+            // else happened: no dead letter announcing a failure for a payout
+            // another worker is still settling.
+            verify(repository).scheduleRetry(eq(PAYOUT_ID), eq(LOCK_TOKEN), any(), any(), any());
+            verifyNoInteractions(deadLetterPublisher);
+        }
+
+        @Test
+        @DisplayName("does not dead letter a payout it could not actually fail")
+        void doesNotDeadLetterWithoutTheRow() {
+            // A dead letter says "this payout is finished and nobody should
+            // expect it to settle". Publishing that while the row is still
+            // PROCESSING under another worker puts a lie on the topic.
+            when(repository.fail(eq(PAYOUT_ID), eq(LOCK_TOKEN), any(), any())).thenReturn(false);
+            doThrow(new SettlementRejectedException("account closed"))
+                    .when(settlementGateway).settle(any());
+
+            processor().process(claimed(1));
+
+            verify(repository).fail(eq(PAYOUT_ID), eq(LOCK_TOKEN), any(), any());
+            verifyNoInteractions(deadLetterPublisher);
+        }
+
+        @Test
+        @DisplayName("a settlement that cannot be confirmed is not silently dropped")
+        void aLostConfirmIsNotSilent() {
+            // The worst case in the whole pipeline: the provider took the money
+            // and the table has no record of it. Nothing here can fix that, so
+            // the requirement is only that the process does not pretend it
+            // succeeded, and does not go on to fail or retry a payout that in
+            // fact settled.
+            when(repository.confirm(PAYOUT_ID, LOCK_TOKEN, NOW)).thenReturn(false);
+
+            processor().process(claimed(1));
+
+            verify(settlementGateway).settle(any());
+            verify(repository).confirm(PAYOUT_ID, LOCK_TOKEN, NOW);
+            verify(repository, never()).scheduleRetry(any(), any(), any(), any(), any());
+            verify(repository, never()).fail(any(), any(), any(), any());
+            verifyNoInteractions(deadLetterPublisher);
+        }
+
+        @Test
+        @DisplayName("the lock is renewed before settling, so a batch tail cannot go stale unnoticed")
+        void renewsBeforeSettling() {
+            processor().process(claimed(1));
+
+            InOrder inOrder = inOrder(repository, settlementGateway);
+            inOrder.verify(repository).renewLock(PAYOUT_ID, LOCK_TOKEN, NOW);
+            inOrder.verify(settlementGateway).settle(any());
+            inOrder.verify(repository).confirm(PAYOUT_ID, LOCK_TOKEN, NOW);
+        }
+    }
+
     private static ClaimedPayout claimed(int attempts) {
-        return new ClaimedPayout(
-                PAYOUT_ID, new BigDecimal("125.5000"), "BRL", CORRELATION_ID, attempts, REQUESTED_AT);
+        return new ClaimedPayout(PAYOUT_ID, LOCK_TOKEN, new BigDecimal("125.5000"), "BRL",
+                CORRELATION_ID, attempts, REQUESTED_AT);
     }
 }
