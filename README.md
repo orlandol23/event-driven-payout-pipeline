@@ -262,10 +262,16 @@ The API starts and serves requests whether or not the broker is up. Without one,
 
 Create a payout:
 
+The `Idempotency-Key` is the caller's secret. Anyone who knows it and the body
+can read the payout back, and a different body confirms the key exists (422).
+Use an unguessable value, a UUID as below, never an order number: there is no
+authentication on this intake, so the key is the only thing standing between a
+payout and a stranger.
+
 ```bash
 curl -i -X POST http://localhost:8080/payouts \
   -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: order-1001' \
+  -H 'Idempotency-Key: 7f3e9c2a-5b1d-4e8f-9a6c-2d4b8e1f0a37' \
   -H 'X-Correlation-Id: demo-trace-1' \
   -d '{"amount": 125.50, "currency": "BRL"}'
 ```
@@ -303,7 +309,7 @@ payout:
 ```bash
 curl -i -X POST http://localhost:8080/payouts \
   -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: order-1001' \
+  -H 'Idempotency-Key: 7f3e9c2a-5b1d-4e8f-9a6c-2d4b8e1f0a37' \
   -d '{"amount": 999.99, "currency": "BRL"}'
 ```
 
@@ -739,6 +745,9 @@ Named here rather than discovered in review:
   often that actually happens.
 
 ## Roadmap
+
+Beyond Day 5: [`docs/ROADMAP.md`](docs/ROADMAP.md). The September 2026 audit,
+with the status of every finding: [`docs/AUDIT-2026-09.md`](docs/AUDIT-2026-09.md).
 
 - [x] **Day 1** API, PostgreSQL, Flyway, validation, RFC 7807, idempotency
 - [x] **Day 2** Kafka producer and consumer, keyed by payout id, manual commit

@@ -90,3 +90,11 @@ Keep the test counts in `README.md` in sync when tests are added.
 - An `Idempotency-Key` replayed with a different body is a 422, not a replay of
   the original. Rows written before migration V2 have a NULL fingerprint and
   still replay; that is documented rather than silently patched.
+
+## Plans and audits
+
+- The plan is `docs/ROADMAP.md`. Nothing in it is ticked by intention: a box
+  closes in the PR that closes it, with the PR linked.
+- `docs/AUDIT-2026-09.md` is the September 2026 security and architecture
+  audit with the status of every finding. A status changes only in the PR that
+  changes the code. Later reviews go in a new dated file, never merged into it.
