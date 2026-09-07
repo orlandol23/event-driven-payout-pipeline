@@ -118,3 +118,40 @@ stated precisely and proven by tests that fail without the fix.
 3. Every guarantee in the README has a test that fails without the code that
    provides it.
 4. Failure modes are documented before a reviewer discovers them.
+
+## Second review, 2026-09-07: beyond the audit
+
+1. **The event has no schema version.** `PayoutRequested` carries no
+   `schemaVersion`, and two services that deploy independently need one. The
+   "independently deployable" claim in the README rests today on nothing but
+   discipline. Phase 6 item: a version field (or a versioned topic name), and a
+   written compatibility rule: consumers ignore unknown fields; producers never
+   remove or retype a field without bumping the version; the contracts module
+   carries a test that fails when a field is removed.
+2. **Pin the poison-record behaviour.** `ErrorHandlingDeserializer` is
+   configured, so a malformed record does not stall the partition. There is no
+   test that says so. Add one: a record that is not JSON reaches the dead-letter
+   topic with the diagnosis header, and the next record on the partition is
+   consumed.
+3. **Partitioning, stated.** Keyed by payout id gives per-payout ordering,
+   which is all this pipeline needs. Say so in the README, with the partition
+   count the compose file assumes and the note that a repartition changes
+   nothing here because nothing depends on cross-payout order.
+4. **Graceful shutdown.** A SIGTERM during `settle()` is a crash by another
+   name. Confirm that the worker's shutdown waits for the in-flight payout
+   (Spring's `spring.lifecycle.timeout-per-shutdown-phase`) and that the
+   Kafka listener stops polling first, and pin it with a test or a documented
+   manual check.
+
+### Repository hygiene (shared by all six repositories)
+
+- **Dependency update automation.** None of the six repositories has Dependabot
+  or Renovate. Add `.github/dependabot.yml` with weekly, grouped updates for
+  Maven and for `github-actions`, and daily security updates.
+- **Responsible disclosure.** No repository has a `SECURITY.md`. Enable GitHub
+  private vulnerability reporting (Settings > Security > "Private vulnerability
+  reporting") and add a `SECURITY.md` that points to it, so a report never has
+  to be a public issue. Do not put a personal email address in the file.
+- **Branch protection on the default branch.** Require the CI checks to pass
+  before merge; forbid force-push and deletion. An owner setting; costs nothing
+  and is the first thing a reviewer checks after the README.
